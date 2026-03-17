@@ -72,6 +72,7 @@ export const initCommand = new Command("init")
             "# INKOS_LLM_BASE_URL=https://api.openai.com/v1",
             "# INKOS_LLM_API_KEY=your-api-key-here",
             "# INKOS_LLM_MODEL=gpt-4o",
+            "# INKOS_HTTP_USER_AGENT=Mozilla/5.0 (compatible; InkOS)",
           ].join("\n"),
           "utf-8",
         );
@@ -92,6 +93,7 @@ export const initCommand = new Command("init")
             "# INKOS_LLM_MAX_TOKENS=8192",
             "# INKOS_LLM_THINKING_BUDGET=0          # Anthropic extended thinking budget",
             "# INKOS_LLM_API_FORMAT=chat             # chat (default) or responses (OpenAI Responses API)",
+            "# INKOS_HTTP_USER_AGENT=Mozilla/5.0 (compatible; InkOS)",
             "",
             "# Anthropic example:",
             "# INKOS_LLM_PROVIDER=anthropic",

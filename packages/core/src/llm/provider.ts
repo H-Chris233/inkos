@@ -2,6 +2,12 @@ import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import type { LLMConfig } from "../models/project.js";
 
+function resolveUserAgent(): string {
+  const fromEnv = process.env.INKOS_HTTP_USER_AGENT?.trim();
+  if (fromEnv) return fromEnv;
+  return "Mozilla/5.0 (compatible; InkOS)";
+}
+
 // === Shared Types ===
 
 export interface LLMResponse {
@@ -65,6 +71,7 @@ export function createLLMClient(config: LLMConfig): LLMClient {
     thinkingBudget: config.thinkingBudget ?? 0,
   };
 
+  const userAgent = resolveUserAgent();
   const apiFormat = config.apiFormat ?? "chat";
   const stream = config.stream ?? true;
 
@@ -75,7 +82,11 @@ export function createLLMClient(config: LLMConfig): LLMClient {
       provider: "anthropic",
       apiFormat,
       stream,
-      _anthropic: new Anthropic({ apiKey: config.apiKey, baseURL }),
+      _anthropic: new Anthropic({
+        apiKey: config.apiKey,
+        baseURL,
+        defaultHeaders: { "User-Agent": userAgent },
+      }),
       defaults,
     };
   }
@@ -84,7 +95,11 @@ export function createLLMClient(config: LLMConfig): LLMClient {
     provider: "openai",
     apiFormat,
     stream,
-    _openai: new OpenAI({ apiKey: config.apiKey, baseURL: config.baseUrl }),
+    _openai: new OpenAI({
+      apiKey: config.apiKey,
+      baseURL: config.baseUrl,
+      defaultHeaders: { "User-Agent": userAgent },
+    }),
     defaults,
   };
 }
