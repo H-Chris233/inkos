@@ -6,6 +6,55 @@ function resolveUserAgent(): string {
   const fromEnv = process.env.INKOS_HTTP_USER_AGENT?.trim();
   if (fromEnv) return fromEnv;
   return "Mozilla/5.0 (compatible; InkOS)";
+// === Streaming Monitor Types ===
+
+export interface StreamProgress {
+  readonly elapsedMs: number;
+  readonly totalChars: number;
+  readonly chineseChars: number;
+  readonly status: "streaming" | "done";
+}
+
+export type OnStreamProgress = (progress: StreamProgress) => void;
+
+export function createStreamMonitor(
+  onProgress?: OnStreamProgress,
+  intervalMs: number = 30000,
+): { readonly onChunk: (text: string) => void; readonly stop: () => void } {
+  let totalChars = 0;
+  let chineseChars = 0;
+  const startTime = Date.now();
+  let timer: ReturnType<typeof setInterval> | undefined;
+
+  if (onProgress) {
+    timer = setInterval(() => {
+      onProgress({
+        elapsedMs: Date.now() - startTime,
+        totalChars,
+        chineseChars,
+        status: "streaming",
+      });
+    }, intervalMs);
+  }
+
+  return {
+    onChunk(text: string): void {
+      totalChars += text.length;
+      chineseChars += (text.match(/[\u4e00-\u9fff]/g) || []).length;
+    },
+    stop(): void {
+      if (timer !== undefined) {
+        clearInterval(timer);
+        timer = undefined;
+      }
+      onProgress?.({
+        elapsedMs: Date.now() - startTime,
+        totalChars,
+        chineseChars,
+        status: "done",
+      });
+    },
+  };
 }
 
 // === Shared Types ===
@@ -34,6 +83,7 @@ export interface LLMClient {
     readonly temperature: number;
     readonly maxTokens: number;
     readonly thinkingBudget: number;
+    readonly extra: Record<string, unknown>;
   };
 }
 
@@ -69,6 +119,7 @@ export function createLLMClient(config: LLMConfig): LLMClient {
     temperature: config.temperature ?? 0.7,
     maxTokens: config.maxTokens ?? 8192,
     thinkingBudget: config.thinkingBudget ?? 0,
+    extra: config.extra ?? {},
   };
 
   const userAgent = resolveUserAgent();
@@ -104,27 +155,63 @@ export function createLLMClient(config: LLMConfig): LLMClient {
   };
 }
 
+// === Partial Response (stream interrupted but usable content received) ===
+
+export class PartialResponseError extends Error {
+  readonly partialContent: string;
+  constructor(partialContent: string, cause: unknown) {
+    super(`Stream interrupted after ${partialContent.length} chars: ${String(cause)}`);
+    this.name = "PartialResponseError";
+    this.partialContent = partialContent;
+  }
+}
+
+/** Minimum chars to consider a partial response salvageable (Chinese ~2 chars/word → 500 chars ≈ 250 words) */
+const MIN_SALVAGEABLE_CHARS = 500;
+
 // === Error Wrapping ===
 
-function wrapLLMError(error: unknown): Error {
+function wrapLLMError(error: unknown, context?: { readonly baseUrl?: string; readonly model?: string }): Error {
   const msg = String(error);
+  const ctxLine = context
+    ? `\n  (baseUrl: ${context.baseUrl}, model: ${context.model})`
+    : "";
+
+  if (msg.includes("400")) {
+    return new Error(
+      `API 返回 400 (请求参数错误)。可能原因：\n` +
+      `  1. 模型名称不正确（检查 INKOS_LLM_MODEL）\n` +
+      `  2. 提供方不支持某些参数（如 max_tokens、stream）\n` +
+      `  3. 消息格式不兼容（部分提供方不支持 system role）\n` +
+      `  建议：在 inkos.json 中设置 "stream": false 试试，或检查提供方文档${ctxLine}`,
+    );
+  }
   if (msg.includes("403")) {
     return new Error(
       `API 返回 403 (请求被拒绝)。可能原因：\n` +
       `  1. API Key 无效或过期\n` +
       `  2. API 提供方的内容审查拦截了请求（公益/免费 API 常见）\n` +
       `  3. 账户余额不足\n` +
-      `  建议：用 inkos doctor 测试 API 连通性，或换一个不限制内容的 API 提供方`,
+      `  建议：用 inkos doctor 测试 API 连通性，或换一个不限制内容的 API 提供方${ctxLine}`,
     );
   }
   if (msg.includes("401")) {
     return new Error(
-      `API 返回 401 (未授权)。请检查 .env 中的 INKOS_LLM_API_KEY 是否正确。`,
+      `API 返回 401 (未授权)。请检查 .env 中的 INKOS_LLM_API_KEY 是否正确。${ctxLine}`,
     );
   }
   if (msg.includes("429")) {
     return new Error(
-      `API 返回 429 (请求过多)。请稍后重试，或检查 API 配额。`,
+      `API 返回 429 (请求过多)。请稍后重试，或检查 API 配额。${ctxLine}`,
+    );
+  }
+  if (msg.includes("Connection error") || msg.includes("ECONNREFUSED") || msg.includes("ENOTFOUND") || msg.includes("fetch failed")) {
+    return new Error(
+      `无法连接到 API 服务。可能原因：\n` +
+      `  1. baseUrl 地址不正确（当前：${context?.baseUrl ?? "未知"}）\n` +
+      `  2. 网络不通或被防火墙拦截\n` +
+      `  3. API 服务暂时不可用\n` +
+      `  建议：检查 INKOS_LLM_BASE_URL 是否包含完整路径（如 /v1）`,
     );
   }
   return error instanceof Error ? error : new Error(msg);
@@ -140,29 +227,78 @@ export async function chatCompletion(
     readonly temperature?: number;
     readonly maxTokens?: number;
     readonly webSearch?: boolean;
+    readonly onStreamProgress?: OnStreamProgress;
   },
 ): Promise<LLMResponse> {
+  const resolved = {
+    temperature: options?.temperature ?? client.defaults.temperature,
+    maxTokens: options?.maxTokens ?? client.defaults.maxTokens,
+    extra: client.defaults.extra,
+  };
+  const onStreamProgress = options?.onStreamProgress;
+  const errorCtx = { baseUrl: client._openai?.baseURL ?? "(anthropic)", model };
+
   try {
-    const resolved = {
-      temperature: options?.temperature ?? client.defaults.temperature,
-      maxTokens: options?.maxTokens ?? client.defaults.maxTokens,
-    };
     if (client.provider === "anthropic") {
       return client.stream
-        ? await chatCompletionAnthropic(client._anthropic!, model, messages, resolved, client.defaults.thinkingBudget)
+        ? await chatCompletionAnthropic(client._anthropic!, model, messages, resolved, client.defaults.thinkingBudget, onStreamProgress)
         : await chatCompletionAnthropicSync(client._anthropic!, model, messages, resolved, client.defaults.thinkingBudget);
     }
     if (client.apiFormat === "responses") {
       return client.stream
-        ? await chatCompletionOpenAIResponses(client._openai!, model, messages, resolved, options?.webSearch)
+        ? await chatCompletionOpenAIResponses(client._openai!, model, messages, resolved, options?.webSearch, onStreamProgress)
         : await chatCompletionOpenAIResponsesSync(client._openai!, model, messages, resolved, options?.webSearch);
     }
     return client.stream
-      ? await chatCompletionOpenAIChat(client._openai!, model, messages, resolved, options?.webSearch)
+      ? await chatCompletionOpenAIChat(client._openai!, model, messages, resolved, options?.webSearch, onStreamProgress)
       : await chatCompletionOpenAIChatSync(client._openai!, model, messages, resolved, options?.webSearch);
   } catch (error) {
-    throw wrapLLMError(error);
+    // Stream interrupted but partial content is usable — return truncated response
+    if (error instanceof PartialResponseError) {
+      return {
+        content: error.partialContent,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      };
+    }
+
+    // Auto-fallback: if streaming failed, retry with sync (many proxies don't support SSE)
+    if (client.stream) {
+      const isStreamRelated = isLikelyStreamError(error);
+      if (isStreamRelated) {
+        try {
+          if (client.provider === "anthropic") {
+            return await chatCompletionAnthropicSync(client._anthropic!, model, messages, resolved, client.defaults.thinkingBudget);
+          }
+          if (client.apiFormat === "responses") {
+            return await chatCompletionOpenAIResponsesSync(client._openai!, model, messages, resolved, options?.webSearch);
+          }
+          return await chatCompletionOpenAIChatSync(client._openai!, model, messages, resolved, options?.webSearch);
+        } catch (syncError) {
+          throw wrapLLMError(syncError, errorCtx);
+        }
+      }
+    }
+
+    throw wrapLLMError(error, errorCtx);
   }
+}
+
+function isLikelyStreamError(error: unknown): boolean {
+  const msg = String(error).toLowerCase();
+  // Common indicators that streaming specifically is the problem:
+  // - SSE parse errors, chunked transfer issues, content-type mismatches
+  // - Some proxies return 400/415 when stream=true
+  // - "stream" mentioned in error, or generic network errors during streaming
+  return (
+    msg.includes("stream") ||
+    msg.includes("text/event-stream") ||
+    msg.includes("chunked") ||
+    msg.includes("unexpected end") ||
+    msg.includes("premature close") ||
+    msg.includes("terminated") ||
+    msg.includes("econnreset") ||
+    (msg.includes("400") && !msg.includes("content"))
+  );
 }
 
 // === Tool-calling Chat (used by agent loop) ===
@@ -201,32 +337,49 @@ async function chatCompletionOpenAIChat(
   client: OpenAI,
   model: string,
   messages: ReadonlyArray<LLMMessage>,
-  options: { readonly temperature: number; readonly maxTokens: number },
+  options: { readonly temperature: number; readonly maxTokens: number; readonly extra: Record<string, unknown> },
   webSearch?: boolean,
+  onStreamProgress?: OnStreamProgress,
 ): Promise<LLMResponse> {
-  const stream = await client.chat.completions.create({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const createParams: any = {
     model,
-    messages: messages.map((m) => ({
-      role: m.role,
-      content: m.content,
-    })),
+    messages: messages.map((m) => ({ role: m.role, content: m.content })),
     temperature: options.temperature,
     max_tokens: options.maxTokens,
     stream: true,
     ...(webSearch ? { web_search_options: { search_context_size: "medium" as const } } : {}),
-  });
+    ...options.extra,
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const stream = await client.chat.completions.create(createParams) as any;
 
   const chunks: string[] = [];
   let inputTokens = 0;
   let outputTokens = 0;
+  const monitor = createStreamMonitor(onStreamProgress);
 
-  for await (const chunk of stream) {
-    const delta = chunk.choices[0]?.delta?.content;
-    if (delta) chunks.push(delta);
-    if (chunk.usage) {
-      inputTokens = chunk.usage.prompt_tokens ?? 0;
-      outputTokens = chunk.usage.completion_tokens ?? 0;
+  try {
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta?.content;
+      if (delta) {
+        chunks.push(delta);
+        monitor.onChunk(delta);
+      }
+      if (chunk.usage) {
+        inputTokens = chunk.usage.prompt_tokens ?? 0;
+        outputTokens = chunk.usage.completion_tokens ?? 0;
+      }
     }
+  } catch (streamError) {
+    monitor.stop();
+    const partial = chunks.join("");
+    if (partial.length >= MIN_SALVAGEABLE_CHARS) {
+      throw new PartialResponseError(partial, streamError);
+    }
+    throw streamError;
+  } finally {
+    monitor.stop();
   }
 
   const content = chunks.join("");
@@ -246,16 +399,19 @@ async function chatCompletionOpenAIChatSync(
   client: OpenAI,
   model: string,
   messages: ReadonlyArray<LLMMessage>,
-  options: { readonly temperature: number; readonly maxTokens: number },
+  options: { readonly temperature: number; readonly maxTokens: number; readonly extra: Record<string, unknown> },
   _webSearch?: boolean,
 ): Promise<LLMResponse> {
-  const response = await client.chat.completions.create({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const syncParams: any = {
     model,
     messages: messages.map((m) => ({ role: m.role, content: m.content })),
     temperature: options.temperature,
     max_tokens: options.maxTokens,
     stream: false,
-  });
+    ...options.extra,
+  };
+  const response = await client.chat.completions.create(syncParams);
 
   const content = response.choices[0]?.message?.content ?? "";
   if (!content) throw new Error("LLM returned empty response");
@@ -371,6 +527,7 @@ async function chatCompletionOpenAIResponses(
   messages: ReadonlyArray<LLMMessage>,
   options: { readonly temperature: number; readonly maxTokens: number },
   webSearch?: boolean,
+  onStreamProgress?: OnStreamProgress,
 ): Promise<LLMResponse> {
   const input: OpenAI.Responses.ResponseInputItem[] = messages.map((m) => ({
     role: m.role as "system" | "user" | "assistant",
@@ -393,15 +550,28 @@ async function chatCompletionOpenAIResponses(
   const chunks: string[] = [];
   let inputTokens = 0;
   let outputTokens = 0;
+  const monitor = createStreamMonitor(onStreamProgress);
 
-  for await (const event of stream) {
-    if (event.type === "response.output_text.delta") {
-      chunks.push(event.delta);
+  try {
+    for await (const event of stream) {
+      if (event.type === "response.output_text.delta") {
+        chunks.push(event.delta);
+        monitor.onChunk(event.delta);
+      }
+      if (event.type === "response.completed") {
+        inputTokens = event.response.usage?.input_tokens ?? 0;
+        outputTokens = event.response.usage?.output_tokens ?? 0;
+      }
     }
-    if (event.type === "response.completed") {
-      inputTokens = event.response.usage?.input_tokens ?? 0;
-      outputTokens = event.response.usage?.output_tokens ?? 0;
+  } catch (streamError) {
+    monitor.stop();
+    const partial = chunks.join("");
+    if (partial.length >= MIN_SALVAGEABLE_CHARS) {
+      throw new PartialResponseError(partial, streamError);
     }
+    throw streamError;
+  } finally {
+    monitor.stop();
   }
 
   const content = chunks.join("");
@@ -550,6 +720,7 @@ async function chatCompletionAnthropic(
   messages: ReadonlyArray<LLMMessage>,
   options: { readonly temperature: number; readonly maxTokens: number },
   thinkingBudget: number = 0,
+  onStreamProgress?: OnStreamProgress,
 ): Promise<LLMResponse> {
   const systemText = messages
     .filter((m) => m.role === "system")
@@ -574,17 +745,30 @@ async function chatCompletionAnthropic(
   const chunks: string[] = [];
   let inputTokens = 0;
   let outputTokens = 0;
+  const monitor = createStreamMonitor(onStreamProgress);
 
-  for await (const event of stream) {
-    if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-      chunks.push(event.delta.text);
+  try {
+    for await (const event of stream) {
+      if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+        chunks.push(event.delta.text);
+        monitor.onChunk(event.delta.text);
+      }
+      if (event.type === "message_start") {
+        inputTokens = event.message.usage?.input_tokens ?? 0;
+      }
+      if (event.type === "message_delta") {
+        outputTokens = ((event as unknown as { usage?: { output_tokens?: number } }).usage?.output_tokens) ?? 0;
+      }
     }
-    if (event.type === "message_start") {
-      inputTokens = event.message.usage?.input_tokens ?? 0;
+  } catch (streamError) {
+    monitor.stop();
+    const partial = chunks.join("");
+    if (partial.length >= MIN_SALVAGEABLE_CHARS) {
+      throw new PartialResponseError(partial, streamError);
     }
-    if (event.type === "message_delta") {
-      outputTokens = ((event as unknown as { usage?: { output_tokens?: number } }).usage?.output_tokens) ?? 0;
-    }
+    throw streamError;
+  } finally {
+    monitor.stop();
   }
 
   const content = chunks.join("");

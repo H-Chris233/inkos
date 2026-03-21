@@ -1,8 +1,9 @@
 import { Command } from "commander";
-import { access } from "node:fs/promises";
-import { join } from "node:path";
+import { access, readFile, rm } from "node:fs/promises";
+import { createInterface } from "node:readline";
+import { join, resolve } from "node:path";
 import { PipelineRunner, StateManager, type BookConfig } from "@actalk/inkos-core";
-import { loadConfig, buildPipelineConfig, findProjectRoot, resolveContext, resolveBookId, log, logError } from "../utils.js";
+import { loadConfig, buildPipelineConfig, findProjectRoot, resolveBookId, log, logError } from "../utils.js";
 
 export const bookCommand = new Command("book")
   .description("Manage books");
@@ -15,8 +16,8 @@ bookCommand
   .option("--platform <platform>", "Target platform", "tomato")
   .option("--target-chapters <n>", "Target chapter count", "200")
   .option("--chapter-words <n>", "Words per chapter", "3000")
-  .option("--context <text>", "External context / instructions (natural language)")
-  .option("--context-file <path>", "Read external context from file")
+  .option("--brief <path>", "Path to creative brief file (.md/.txt) — Architect builds from your ideas instead of generating from scratch")
+  .option("--lang <language>", "Writing language: zh (Chinese) or en (English). Defaults from genre.")
   .option("--json", "Output JSON")
   .action(async (opts) => {
     try {
@@ -38,6 +39,7 @@ bookCommand
         status: "outlining",
         targetChapters: parseInt(opts.targetChapters, 10),
         chapterWordCount: parseInt(opts.chapterWords, 10),
+        language: opts.lang ?? config.language,
         createdAt: now,
         updatedAt: now,
       };
@@ -61,9 +63,11 @@ bookCommand
 
       if (!opts.json) log(`Creating book "${book.title}" (${book.genre} / ${book.platform})...`);
 
-      const context = await resolveContext(opts);
+      const brief = opts.brief
+        ? await readFile(resolve(opts.brief), "utf-8")
+        : undefined;
 
-      const pipeline = new PipelineRunner(buildPipelineConfig(config, root, { externalContext: context }));
+      const pipeline = new PipelineRunner(buildPipelineConfig(config, root, { externalContext: brief }));
 
       await pipeline.initBook(book);
 
@@ -100,6 +104,7 @@ bookCommand
   .option("--chapter-words <n>", "Words per chapter")
   .option("--target-chapters <n>", "Target chapter count")
   .option("--status <status>", "Book status (outlining/active/paused/completed)")
+  .option("--lang <language>", "Writing language: zh or en")
   .option("--json", "Output JSON")
   .action(async (bookIdArg: string | undefined, opts) => {
     try {
@@ -112,6 +117,7 @@ bookCommand
       if (opts.chapterWords) updates.chapterWordCount = parseInt(opts.chapterWords, 10);
       if (opts.targetChapters) updates.targetChapters = parseInt(opts.targetChapters, 10);
       if (opts.status) updates.status = opts.status;
+      if (opts.lang) updates.language = opts.lang;
 
       if (Object.keys(updates).length === 0) {
         if (opts.json) {
@@ -195,6 +201,58 @@ bookCommand
         log(JSON.stringify({ error: String(e) }));
       } else {
         logError(`Failed to list books: ${e}`);
+      }
+      process.exit(1);
+    }
+  });
+
+bookCommand
+  .command("delete")
+  .description("Delete a book and all its chapters, truth files, and snapshots")
+  .argument("<book-id>", "Book ID to delete")
+  .option("--force", "Skip confirmation prompt")
+  .option("--json", "Output JSON")
+  .action(async (bookId: string, opts) => {
+    try {
+      const root = findProjectRoot();
+      const state = new StateManager(root);
+
+      const allBooks = await state.listBooks();
+      if (!allBooks.includes(bookId)) {
+        throw new Error(`Book "${bookId}" not found. Available: ${allBooks.join(", ") || "(none)"}`);
+      }
+
+      const book = await state.loadBookConfig(bookId);
+      const index = await state.loadChapterIndex(bookId);
+
+      if (!opts.force) {
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        const answer = await new Promise<string>((resolve) => {
+          rl.question(
+            `Delete "${book.title}" (${bookId})? This will remove ${index.length} chapter(s) and all data. (y/N) `,
+            resolve,
+          );
+        });
+        rl.close();
+        if (answer.toLowerCase() !== "y") {
+          log("Cancelled.");
+          return;
+        }
+      }
+
+      const bookDir = join(root, "books", bookId);
+      await rm(bookDir, { recursive: true, force: true });
+
+      if (opts.json) {
+        log(JSON.stringify({ deleted: bookId, chapters: index.length }));
+      } else {
+        log(`Deleted "${book.title}" (${bookId}): ${index.length} chapter(s) removed.`);
+      }
+    } catch (e) {
+      if (opts.json) {
+        log(JSON.stringify({ error: String(e) }));
+      } else {
+        logError(`Failed to delete book: ${e}`);
       }
       process.exit(1);
     }

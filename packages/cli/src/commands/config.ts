@@ -29,7 +29,8 @@ configCommand
         "daemon.retryDelayMs", "daemon.cooldownAfterChapterMs",
         "daemon.maxChaptersPerDay",
       ]);
-      if (!KNOWN_KEYS.has(key)) {
+      // Allow any key under llm.extra.* (passthrough to API)
+      if (!KNOWN_KEYS.has(key) && !key.startsWith("llm.extra.")) {
         // Find closest match by edit distance on the last segment
         const candidates = [...KNOWN_KEYS];
         const inputParts = key.split(".");
@@ -93,6 +94,7 @@ configCommand
   .option("--max-tokens <n>", "Max output tokens")
   .option("--thinking-budget <n>", "Anthropic thinking budget")
   .option("--api-format <format>", "API format (chat / responses)")
+  .option("--lang <language>", "Default writing language: zh (Chinese) or en (English)")
   .action(async (opts) => {
     try {
       await mkdir(GLOBAL_CONFIG_DIR, { recursive: true });
@@ -108,6 +110,7 @@ configCommand
       if (opts.maxTokens) lines.push(`INKOS_LLM_MAX_TOKENS=${opts.maxTokens}`);
       if (opts.thinkingBudget) lines.push(`INKOS_LLM_THINKING_BUDGET=${opts.thinkingBudget}`);
       if (opts.apiFormat) lines.push(`INKOS_LLM_API_FORMAT=${opts.apiFormat}`);
+      if (opts.lang) lines.push(`INKOS_DEFAULT_LANGUAGE=${opts.lang}`);
 
       await writeFile(GLOBAL_ENV_PATH, lines.join("\n") + "\n", "utf-8");
       log(`Global config saved to ${GLOBAL_ENV_PATH}`);
@@ -162,7 +165,7 @@ configCommand
   .command("set-model")
   .description("Set model override for a specific agent (with optional provider routing)")
   .argument("<agent>", `Agent name (${KNOWN_AGENTS.join(", ")})`)
-  .argument("<model>", "Model name (e.g., gpt-4o, gemini-2.5-flash)")
+  .argument("<model>", "Model name")
   .option("--base-url <url>", "API base URL (for different provider)")
   .option("--provider <provider>", "Provider type (openai / anthropic / custom)")
   .option("--api-key-env <envVar>", "Env variable name for API key (e.g., PACKYAPI_KEY)")

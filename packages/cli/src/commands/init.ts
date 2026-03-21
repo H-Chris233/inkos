@@ -15,7 +15,8 @@ async function hasGlobalConfig(): Promise<boolean> {
 export const initCommand = new Command("init")
   .description("Initialize an InkOS project (current directory by default)")
   .argument("[name]", "Project name (creates subdirectory). Omit to init current directory.")
-  .action(async (name?: string) => {
+  .option("--lang <language>", "Default writing language: zh (Chinese) or en (English)", "zh")
+  .action(async (name: string | undefined, opts: { lang?: string }) => {
     const projectDir = name ? join(process.cwd(), name) : process.cwd();
     const projectName = name ?? basename(projectDir);
 
@@ -38,10 +39,11 @@ export const initCommand = new Command("init")
       const config = {
         name: projectName,
         version: "0.1.0",
+        language: opts.lang ?? "zh",
         llm: {
           provider: process.env.INKOS_LLM_PROVIDER ?? "openai",
-          baseUrl: process.env.INKOS_LLM_BASE_URL ?? "https://api.openai.com/v1",
-          model: process.env.INKOS_LLM_MODEL ?? "gpt-4o",
+          baseUrl: process.env.INKOS_LLM_BASE_URL ?? "",
+          model: process.env.INKOS_LLM_MODEL ?? "",
         },
         notify: [],
         daemon: {
@@ -73,6 +75,8 @@ export const initCommand = new Command("init")
             "# INKOS_LLM_API_KEY=your-api-key-here",
             "# INKOS_LLM_MODEL=gpt-4o",
             "# INKOS_HTTP_USER_AGENT=Mozilla/5.0 (compatible; InkOS)",
+            "# Web search (optional):",
+            "# TAVILY_API_KEY=tvly-xxxxx",
           ].join("\n"),
           "utf-8",
         );
@@ -84,9 +88,9 @@ export const initCommand = new Command("init")
             "# Tip: Run 'inkos config set-global' to set once for all projects.",
             "# Provider: openai (OpenAI / compatible proxy), anthropic (Anthropic native)",
             "INKOS_LLM_PROVIDER=openai",
-            "INKOS_LLM_BASE_URL=https://api.openai.com/v1",
-            "INKOS_LLM_API_KEY=your-api-key-here",
-            "INKOS_LLM_MODEL=gpt-4o",
+            "INKOS_LLM_BASE_URL=",
+            "INKOS_LLM_API_KEY=",
+            "INKOS_LLM_MODEL=",
             "",
             "# Optional parameters (defaults shown):",
             "# INKOS_LLM_TEMPERATURE=0.7",
@@ -95,10 +99,14 @@ export const initCommand = new Command("init")
             "# INKOS_LLM_API_FORMAT=chat             # chat (default) or responses (OpenAI Responses API)",
             "# INKOS_HTTP_USER_AGENT=Mozilla/5.0 (compatible; InkOS)",
             "",
+            "# Web search (optional, for auditor era-research):",
+            "# TAVILY_API_KEY=tvly-xxxxx              # Free at tavily.com (1000 searches/month)",
+            "",
             "# Anthropic example:",
             "# INKOS_LLM_PROVIDER=anthropic",
-            "# INKOS_LLM_BASE_URL=https://api.anthropic.com",
-            "# INKOS_LLM_MODEL=claude-sonnet-4-5-20250514",
+            "# INKOS_LLM_PROVIDER=anthropic",
+            "# INKOS_LLM_BASE_URL=",
+            "# INKOS_LLM_MODEL=",
           ].join("\n"),
           "utf-8",
         );
@@ -122,7 +130,7 @@ export const initCommand = new Command("init")
         log("Next steps:");
         if (name) log(`  cd ${name}`);
         log("  # Option 1: Set global config (recommended, one-time):");
-        log("  inkos config set-global --provider openai --base-url https://api.openai.com/v1 --api-key sk-xxx --model gpt-4o");
+        log("  inkos config set-global --provider openai --base-url <your-api-url> --api-key <your-key> --model <your-model>");
         log("  # Option 2: Edit .env for this project only");
         log("");
         log("  inkos book create --title '我的小说' --genre xuanhuan --platform tomato");

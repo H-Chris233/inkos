@@ -8,6 +8,7 @@ export const LLMConfigSchema = z.object({
   temperature: z.number().min(0).max(2).default(0.7),
   maxTokens: z.number().int().min(1).default(8192),
   thinkingBudget: z.number().int().min(0).default(0),
+  extra: z.record(z.unknown()).optional(),
   apiFormat: z.enum(["chat", "responses"]).default("chat"),
   stream: z.boolean().default(true),
 });
@@ -73,6 +74,7 @@ const ModelOverrideValueSchema = z.union([z.string(), AgentLLMOverrideSchema]);
 export const ProjectConfigSchema = z.object({
   name: z.string().min(1),
   version: z.literal("0.1.0"),
+  language: z.enum(["zh", "en"]).default("zh"),
   llm: LLMConfigSchema,
   notify: z.array(NotifyChannelSchema).default([]),
   detection: DetectionConfigSchema.optional(),

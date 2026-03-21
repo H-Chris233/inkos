@@ -5,6 +5,7 @@ import type { BookConfig } from "../models/book.js";
 import type { QualityGates, DetectionConfig } from "../models/project.js";
 import { dispatchWebhookEvent } from "../notify/dispatcher.js";
 import { detectChapter, detectAndRewrite } from "./detection-runner.js";
+import type { Logger } from "../utils/logger.js";
 
 export interface SchedulerConfig extends PipelineConfig {
   readonly radarCron: string;
@@ -33,6 +34,8 @@ export class Scheduler {
   private readonly config: SchedulerConfig;
   private tasks: ScheduledTask[] = [];
   private running = false;
+  private writeCycleInFlight: Promise<void> | null = null;
+  private radarScanInFlight: Promise<void> | null = null;
 
   // Quality gate tracking (per book)
   private consecutiveFailures = new Map<string, number>();
@@ -42,10 +45,13 @@ export class Scheduler {
   // Daily chapter counter: "YYYY-MM-DD" → count
   private dailyChapterCount = new Map<string, number>();
 
+  private readonly log?: Logger;
+
   constructor(config: SchedulerConfig) {
     this.config = config;
     this.pipeline = new PipelineRunner(config);
     this.state = new StateManager(config.projectRoot);
+    this.log = config.logger?.child("scheduler");
   }
 
   async start(): Promise<void> {
@@ -53,7 +59,7 @@ export class Scheduler {
     this.running = true;
 
     // Run write cycle immediately on start, then schedule
-    await this.runWriteCycle();
+    await this.triggerWriteCycle();
 
     // Schedule recurring write cycle
     const writeCycleMs = this.cronToMs(this.config.writeCron);
@@ -62,7 +68,7 @@ export class Scheduler {
       intervalMs: writeCycleMs,
     };
     writeTask.timer = setInterval(() => {
-      this.runWriteCycle().catch((e) => {
+      this.triggerWriteCycle().catch((e) => {
         this.config.onError?.("scheduler", e as Error);
       });
     }, writeCycleMs);
@@ -75,7 +81,7 @@ export class Scheduler {
       intervalMs: radarMs,
     };
     radarTask.timer = setInterval(() => {
-      this.runRadarScan().catch((e) => {
+      this.triggerRadarScan().catch((e) => {
         this.config.onError?.("radar", e as Error);
       });
     }, radarMs);
@@ -92,6 +98,36 @@ export class Scheduler {
 
   get isRunning(): boolean {
     return this.running;
+  }
+
+  private async triggerWriteCycle(): Promise<void> {
+    if (this.writeCycleInFlight) {
+      this.log?.warn("Write cycle still running, skipping overlapping tick");
+      return;
+    }
+
+    const cycle = this.runWriteCycle().finally(() => {
+      if (this.writeCycleInFlight === cycle) {
+        this.writeCycleInFlight = null;
+      }
+    });
+    this.writeCycleInFlight = cycle;
+    await cycle;
+  }
+
+  private async triggerRadarScan(): Promise<void> {
+    if (this.radarScanInFlight) {
+      this.log?.warn("Radar scan still running, skipping overlapping tick");
+      return;
+    }
+
+    const scan = this.runRadarScan().finally(() => {
+      if (this.radarScanInFlight === scan) {
+        this.radarScanInFlight = null;
+      }
+    });
+    this.radarScanInFlight = scan;
+    await scan;
   }
 
   /** Resume a paused book. */
@@ -135,9 +171,7 @@ export class Scheduler {
 
   private async runWriteCycle(): Promise<void> {
     if (this.isDailyCapReached()) {
-      process.stderr.write(
-        `[scheduler] Daily cap reached (${this.config.maxChaptersPerDay}), skipping cycle\n`,
-      );
+      this.log?.info(`Daily cap reached (${this.config.maxChaptersPerDay}), skipping cycle`);
       return;
     }
 
@@ -177,9 +211,7 @@ export class Scheduler {
         // Immediate retry with delay (if within retry limit)
         const failures = this.consecutiveFailures.get(bookId) ?? 0;
         if (failures <= this.gates.maxAuditRetries && this.config.retryDelayMs > 0) {
-          process.stderr.write(
-            `[scheduler] ${bookId} retrying in ${this.config.retryDelayMs}ms\n`,
-          );
+          this.log?.warn(`${bookId} retrying in ${this.config.retryDelayMs}ms`);
           await this.sleep(this.config.retryDelayMs);
           const retrySuccess = await this.writeOneChapter(bookId, bookConfig);
           if (!retrySuccess) break; // Stop this book's cycle on second failure
@@ -283,9 +315,7 @@ export class Scheduler {
     const gates = this.gates;
 
     if (failures <= gates.maxAuditRetries) {
-      process.stderr.write(
-        `[scheduler] ${bookId} audit failed (${failures}/${gates.maxAuditRetries}), will retry\n`,
-      );
+      this.log?.warn(`${bookId} audit failed (${failures}/${gates.maxAuditRetries}), will retry`);
       return;
     }
 
@@ -293,7 +323,7 @@ export class Scheduler {
     if (failures >= gates.pauseAfterConsecutiveFailures) {
       this.pausedBooks.add(bookId);
       const reason = `${failures} consecutive audit failures (threshold: ${gates.pauseAfterConsecutiveFailures})`;
-      process.stderr.write(`[scheduler] ${bookId} PAUSED: ${reason}\n`);
+      this.log?.error(`${bookId} PAUSED: ${reason}`);
       this.config.onPause?.(bookId, reason);
 
       if (this.config.notifyChannels && this.config.notifyChannels.length > 0) {
@@ -322,9 +352,7 @@ export class Scheduler {
     dimension: string,
     count: number,
   ): Promise<void> {
-    process.stderr.write(
-      `[scheduler] DIAGNOSTIC: ${bookId} has ${count} failures in dimension "${dimension}"\n`,
-    );
+    this.log?.warn(`DIAGNOSTIC: ${bookId} has ${count} failures in dimension "${dimension}"`);
 
     if (this.config.notifyChannels && this.config.notifyChannels.length > 0) {
       await dispatchWebhookEvent(this.config.notifyChannels, {

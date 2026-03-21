@@ -1,7 +1,7 @@
 ---
 name: inkos
-description: Autonomous novel writing CLI agent - use for creative fiction writing, novel generation, style imitation, chapter continuation/import, EPUB export, and AIGC detection. Supports Chinese web novel genres (xuanhuan, xianxia, urban, horror, other) with multi-agent pipeline, two-phase writer (creative + settlement), 33-dimension auditing, and token usage analytics.
-version: 1.3.0
+description: Autonomous novel writing CLI agent - use for creative fiction writing, novel generation, style imitation, chapter continuation/import, EPUB export, AIGC detection, and fan fiction. Native English support with 10 built-in English genre profiles (LitRPG, Progression Fantasy, Isekai, Cultivation, System Apocalypse, Dungeon Core, Romantasy, Sci-Fi, Tower Climber, Cozy Fantasy). Also supports Chinese web novel genres (xuanhuan, xianxia, urban, horror, other). Multi-agent pipeline, two-phase writer (creative + settlement), 33-dimension auditing, token usage analytics, creative brief input, structured logging (JSON Lines), multi-model routing, and custom OpenAI-compatible provider support.
+version: 1.5.0
 metadata: { "openclaw": { "emoji": "📖", "requires": { "bins": ["inkos", "node"], "env": [] }, "primaryEnv": "", "homepage": "https://github.com/Narcooo/inkos", "install": [{ "id": "npm", "kind": "node", "package": "@actalk/inkos", "label": "Install InkOS (npm)" }] } }
 ---
 
@@ -13,7 +13,9 @@ The Writer uses a two-phase architecture: Phase 1 (creative writing, temp 0.7) p
 
 ## When to Use InkOS
 
-- **Novel writing**: Create and continue writing novels/books in Chinese web novel genres
+- **English novel writing**: Native English support with 10 genre profiles (LitRPG, Progression Fantasy, Isekai, etc.). Set `--lang en`
+- **Chinese web novel writing**: 5 built-in Chinese genres (xuanhuan, xianxia, urban, horror, other)
+- **Fan fiction**: Create fanfic from source material with 4 modes (canon, au, ooc, cp)
 - **Batch chapter generation**: Generate multiple chapters with consistent quality
 - **Import & continue**: Import existing chapters from a text file, reverse-engineer truth files, and continue writing
 - **Style imitation**: Analyze and adopt writing styles from reference texts
@@ -29,9 +31,20 @@ The Writer uses a two-phase architecture: Phase 1 (creative writing, temp 0.7) p
 # Initialize a project directory (creates config structure)
 inkos init my-writing-project
 
-# Configure your LLM provider (OpenAI, Anthropic, or compatible)
+# Configure your LLM provider (OpenAI, Anthropic, or any OpenAI-compatible API)
 inkos config set-global --provider openai --base-url https://api.openai.com/v1 --api-key sk-xxx --model gpt-4o
+# For compatible/proxy endpoints, use --provider custom:
+# inkos config set-global --provider custom --base-url https://your-proxy.com/v1 --api-key sk-xxx --model gpt-4o
 ```
+
+### Multi-Model Routing (Optional)
+```bash
+# Assign different models to different agents — balance quality and cost
+inkos config set-model writer claude-sonnet-4-20250514 --provider anthropic --base-url https://api.anthropic.com --api-key-env ANTHROPIC_API_KEY
+inkos config set-model auditor gpt-4o --provider openai
+inkos config show-models
+```
+Agents without explicit overrides fall back to the global model.
 
 ### View System Status
 ```bash
@@ -49,6 +62,8 @@ inkos status
 1. **Initialize and create book**:
    ```bash
    inkos book create --title "My Novel Title" --genre xuanhuan --chapter-words 3000
+   # Or with a creative brief (your worldbuilding doc / ideas):
+   inkos book create --title "My Novel Title" --genre xuanhuan --chapter-words 3000 --brief my-ideas.md
    ```
    - Genres: `xuanhuan` (cultivation), `xianxia` (immortal), `urban` (city), `horror`, `other`
    - Returns a `book-id` for all subsequent operations
@@ -204,6 +219,35 @@ inkos stats book-id --json
 - Chapters with most issues, status distribution
 - **Token usage stats**: total prompt/completion tokens, avg tokens per chapter, recent trend
 
+### Workflow 10: Write an English Novel
+
+```bash
+# Create an English LitRPG novel (language auto-detected from genre)
+inkos book create --title "The Last Delver" --genre litrpg --chapter-words 3000
+
+# Or set language explicitly
+inkos book create --title "My Novel" --genre other --lang en
+
+# Set English as default for all projects
+inkos config set-global --lang en
+```
+- 10 English genres: litrpg, progression, isekai, cultivation, system-apocalypse, dungeon-core, romantasy, sci-fi, tower-climber, cozy
+- Each genre has dedicated pacing rules, fatigue word lists (e.g., "delve", "tapestry", "testament"), and audit dimensions
+- Use `inkos genre list` to see all available genres
+
+### Workflow 11: Fan Fiction
+
+```bash
+# Create a fanfic from source material
+inkos fanfic init --title "My Fanfic" --from source-novel.txt --mode canon
+
+# Modes: canon (faithful), au (alternate universe), ooc (out of character), cp (ship-focused)
+inkos fanfic init --title "What If" --from source.txt --mode au --genre other
+```
+- Imports and analyzes source material automatically
+- Fanfic-specific audit dimensions and information boundary controls
+- Ensures new content stays consistent with source canon (or deliberately diverges in au/ooc modes)
+
 ## Advanced: Natural Language Agent Mode
 
 For flexible, conversational requests:
@@ -282,7 +326,7 @@ inkos genre copy xuanhuan --name "dark-xuanhuan" --rules "darker tone, more viol
 | Command | Purpose | Notes |
 |---------|---------|-------|
 | `inkos init [name]` | Initialize project | One-time setup |
-| `inkos book create` | Create new book | Returns book-id |
+| `inkos book create` | Create new book | Returns book-id. `--brief <file>`, `--lang en/zh`, `--genre litrpg/progression/...` |
 | `inkos book list` | List all books | Shows IDs, statuses |
 | `inkos write next` | Full pipeline (draft→audit→revise) | Primary workflow command |
 | `inkos draft` | Generate draft only | No auditing/revision |
@@ -297,11 +341,15 @@ inkos genre copy xuanhuan --name "dark-xuanhuan" --rules "darker tone, more viol
 | `inkos export` | Export finished book | Formats: txt, md, epub |
 | `inkos analytics` / `inkos stats` | View book statistics | Word count, audit rates, token usage |
 | `inkos radar scan` | Platform trend analysis | Informs new book ideas |
-| `inkos config set-global` | Configure LLM provider | OpenAI/Anthropic/compatible |
+| `inkos config set-global` | Configure LLM provider | OpenAI/Anthropic/custom (any OpenAI-compatible) |
+| `inkos config set-model <agent> <model>` | Set model override for a specific agent | `--provider`, `--base-url`, `--api-key-env` for multi-provider routing |
+| `inkos config show-models` | Show current model routing | View per-agent model assignments |
 | `inkos doctor` | Diagnose issues | Check installation |
 | `inkos update` | Update to latest version | Self-update |
-| `inkos up/down` | Daemon mode | Background processing |
+| `inkos up/down` | Daemon mode | Background processing. Logs to `inkos.log` (JSON Lines). `-q` for quiet mode |
 | `inkos review list/approve-all` | Manage chapter approvals | Quality gate |
+| `inkos fanfic init` | Create fanfic from source material | `--from <file>`, `--mode canon/au/ooc/cp` |
+| `inkos genre list` | List all available genres | Shows English and Chinese genres with default language |
 
 ## Error Handling
 

@@ -2,12 +2,15 @@ import { BaseAgent } from "./base.js";
 import type { BookConfig } from "../models/book.js";
 import type { GenreProfile } from "../models/genre-profile.js";
 import type { BookRules } from "../models/book-rules.js";
-import { buildWriterSystemPrompt } from "./writer-prompts.js";
+import { buildWriterSystemPrompt, type FanficContext } from "./writer-prompts.js";
 import { buildSettlerSystemPrompt, buildSettlerUserPrompt } from "./settler-prompts.js";
+import { buildObserverSystemPrompt, buildObserverUserPrompt } from "./observer-prompts.js";
 import { parseSettlementOutput } from "./settler-parser.js";
 import { readGenreProfile, readBookRules } from "./rules-reader.js";
 import { validatePostWrite, type PostWriteViolation } from "./post-write-validator.js";
 import { analyzeAITells } from "./ai-tells.js";
+import { filterHooks, filterSummaries, filterSubplots, filterEmotionalArcs, filterCharacterMatrix } from "../utils/context-filter.js";
+import { extractPOVFromOutline, filterMatrixByPOV, filterHooksByPOV } from "../utils/pov-filter.js";
 import { parseCreativeOutput } from "./writer-parser.js";
 import { readFile, writeFile, mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -57,7 +60,7 @@ export class WriterAgent extends BaseAgent {
     const [
       storyBible, volumeOutline, styleGuide, currentState, ledger, hooks,
       chapterSummaries, subplotBoard, emotionalArcs, characterMatrix, styleProfileRaw,
-      parentCanon,
+      parentCanon, fanficCanonRaw,
     ] = await Promise.all([
         this.readFileOrDefault(join(bookDir, "story/story_bible.md")),
         this.readFileOrDefault(join(bookDir, "story/volume_outline.md")),
@@ -71,9 +74,12 @@ export class WriterAgent extends BaseAgent {
         this.readFileOrDefault(join(bookDir, "story/character_matrix.md")),
         this.readFileOrDefault(join(bookDir, "story/style_profile.json")),
         this.readFileOrDefault(join(bookDir, "story/parent_canon.md")),
+        this.readFileOrDefault(join(bookDir, "story/fanfic_canon.md")),
       ]);
 
     const recentChapters = await this.loadRecentChapters(bookDir, chapterNumber);
+    // Load more chapters for dialogue fingerprint extraction (voice consistency over longer span)
+    const fingerprintChapters = await this.loadRecentChapters(bookDir, chapterNumber, 5);
 
     // Load genre profile + book rules
     const { profile: genreProfile, body: genreBody } =
@@ -84,16 +90,43 @@ export class WriterAgent extends BaseAgent {
 
     const styleFingerprint = this.buildStyleFingerprint(styleProfileRaw);
 
-    const dialogueFingerprints = this.extractDialogueFingerprints(recentChapters, storyBible);
+    const dialogueFingerprints = this.extractDialogueFingerprints(fingerprintChapters, storyBible);
     const relevantSummaries = this.findRelevantSummaries(chapterSummaries, volumeOutline, chapterNumber);
 
     const hasParentCanon = parentCanon !== "(文件尚未创建)";
+    const hasFanficCanon = fanficCanonRaw !== "(文件尚未创建)";
+
+    // Build fanfic context if fanfic_canon.md exists
+    const fanficContext: FanficContext | undefined = hasFanficCanon && bookRules?.fanficMode
+      ? {
+          fanficCanon: fanficCanonRaw,
+          fanficMode: bookRules.fanficMode,
+          allowedDeviations: bookRules.allowedDeviations ?? [],
+        }
+      : undefined;
 
     // ── Phase 1: Creative writing (temperature 0.7) ──
+    const resolvedLanguage = book.language ?? genreProfile.language;
     const creativeSystemPrompt = buildWriterSystemPrompt(
       book, genreProfile, bookRules, bookRulesBody, genreBody, styleGuide, styleFingerprint,
-      chapterNumber, "creative",
+      chapterNumber, "creative", fanficContext, resolvedLanguage,
     );
+
+    // Smart context filtering: inject only relevant parts of truth files
+    const filteredHooks = filterHooks(hooks);
+    const filteredSummaries = filterSummaries(chapterSummaries, chapterNumber);
+    const filteredSubplots = filterSubplots(subplotBoard);
+    const filteredArcs = filterEmotionalArcs(emotionalArcs, chapterNumber);
+    const filteredMatrix = filterCharacterMatrix(characterMatrix, volumeOutline, bookRules?.protagonist?.name);
+
+    // POV-aware filtering: limit context to what the POV character knows
+    const povCharacter = extractPOVFromOutline(volumeOutline, chapterNumber);
+    const povFilteredMatrix = povCharacter
+      ? filterMatrixByPOV(filteredMatrix, povCharacter)
+      : filteredMatrix;
+    const povFilteredHooks = povCharacter
+      ? filterHooksByPOV(filteredHooks, povCharacter, chapterSummaries)
+      : filteredHooks;
 
     const creativeUserPrompt = this.buildUserPrompt({
       chapterNumber,
@@ -101,22 +134,23 @@ export class WriterAgent extends BaseAgent {
       volumeOutline,
       currentState,
       ledger: genreProfile.numericalSystem ? ledger : "",
-      hooks,
+      hooks: povFilteredHooks,
       recentChapters,
       wordCount: input.wordCountOverride ?? book.chapterWordCount,
       externalContext: input.externalContext,
-      chapterSummaries,
-      subplotBoard,
-      emotionalArcs,
-      characterMatrix,
+      chapterSummaries: filteredSummaries,
+      subplotBoard: filteredSubplots,
+      emotionalArcs: filteredArcs,
+      characterMatrix: povFilteredMatrix,
       dialogueFingerprints,
       relevantSummaries,
       parentCanon: hasParentCanon ? parentCanon : undefined,
+      language: book.language ?? genreProfile.language,
     });
 
     const creativeTemperature = input.temperatureOverride ?? 0.7;
 
-    process.stderr.write(`[writer] Phase 1: creative writing for chapter ${chapterNumber}\n`);
+    this.ctx.logger?.info(`Phase 1: creative writing for chapter ${chapterNumber}`);
 
     // Scale maxTokens to chapter word count (Chinese ≈ 1.5 tokens/char)
     const targetWords = input.wordCountOverride ?? book.chapterWordCount;
@@ -134,7 +168,7 @@ export class WriterAgent extends BaseAgent {
     const creative = parseCreativeOutput(chapterNumber, creativeResponse.content);
 
     // ── Phase 2: State settlement (temperature 0.3) ──
-    process.stderr.write(`[writer] Phase 2: state settlement for chapter ${chapterNumber} (${creative.wordCount} chars)\n`);
+    this.ctx.logger?.info(`Phase 2: state settlement for chapter ${chapterNumber} (${creative.wordCount} chars)`);
 
     const settleResult = await this.settle({
       book,
@@ -163,19 +197,19 @@ export class WriterAgent extends BaseAgent {
     const postWriteWarnings = ruleViolations.filter(v => v.severity === "warning");
 
     if (ruleViolations.length > 0) {
-      process.stderr.write(
-        `[writer] Post-write: ${postWriteErrors.length} errors, ${postWriteWarnings.length} warnings in chapter ${chapterNumber}\n`,
+      this.ctx.logger?.warn(
+        `Post-write: ${postWriteErrors.length} errors, ${postWriteWarnings.length} warnings in chapter ${chapterNumber}`,
       );
       for (const v of ruleViolations) {
-        process.stderr.write(`  [${v.severity}] ${v.rule}: ${v.description}\n`);
+        this.ctx.logger?.warn(`[${v.severity}] ${v.rule}: ${v.description}`);
       }
     }
     if (aiTellIssues.length > 0) {
-      process.stderr.write(
-        `[writer] AI-tell check: ${aiTellIssues.length} issues in chapter ${chapterNumber}\n`,
+      this.ctx.logger?.warn(
+        `AI-tell check: ${aiTellIssues.length} issues in chapter ${chapterNumber}`,
       );
       for (const issue of aiTellIssues) {
-        process.stderr.write(`  [${issue.severity}] ${issue.category}: ${issue.description}\n`);
+        this.ctx.logger?.warn(`[${issue.severity}] ${issue.category}: ${issue.description}`);
       }
     }
 
@@ -222,8 +256,25 @@ export class WriterAgent extends BaseAgent {
     readonly characterMatrix: string;
     readonly volumeOutline: string;
   }): Promise<{ settlement: ReturnType<typeof parseSettlementOutput>; usage: TokenUsage }> {
+    // Phase 2a: Observer — extract all facts from the chapter
+    const resolvedLang = params.book.language ?? params.genreProfile.language;
+    const observerSystem = buildObserverSystemPrompt(params.book, params.genreProfile, resolvedLang);
+    const observerUser = buildObserverUserPrompt(params.chapterNumber, params.title, params.content, resolvedLang);
+
+    this.ctx.logger?.info(`Phase 2a: observing facts for chapter ${params.chapterNumber}`);
+    const observerResponse = await this.chat(
+      [
+        { role: "system", content: observerSystem },
+        { role: "user", content: observerUser },
+      ],
+      { maxTokens: 4096, temperature: 0.5 },
+    );
+    const observations = observerResponse.content;
+
+    // Phase 2b: Reflector — merge observations into truth files
+    this.ctx.logger?.info(`Phase 2b: reflecting observations into truth files`);
     const settlerSystem = buildSettlerSystemPrompt(
-      params.book, params.genreProfile, params.bookRules,
+      params.book, params.genreProfile, params.bookRules, resolvedLang,
     );
 
     const settlerUser = buildSettlerUserPrompt({
@@ -238,6 +289,7 @@ export class WriterAgent extends BaseAgent {
       emotionalArcs: params.emotionalArcs,
       characterMatrix: params.characterMatrix,
       volumeOutline: params.volumeOutline,
+      observations,
     });
 
     // Settler outputs all truth files — scale with content size
@@ -261,6 +313,7 @@ export class WriterAgent extends BaseAgent {
     bookDir: string,
     output: WriteChapterOutput,
     numericalSystem: boolean = true,
+    language: "zh" | "en" = "zh",
   ): Promise<void> {
     const chaptersDir = join(bookDir, "chapters");
     const storyDir = join(bookDir, "story");
@@ -269,8 +322,11 @@ export class WriterAgent extends BaseAgent {
     const paddedNum = String(output.chapterNumber).padStart(4, "0");
     const filename = `${paddedNum}_${this.sanitizeFilename(output.title)}.md`;
 
+    const heading = language === "en"
+      ? `# Chapter ${output.chapterNumber}: ${output.title}`
+      : `# 第${output.chapterNumber}章 ${output.title}`;
     const chapterContent = [
-      `# 第${output.chapterNumber}章 ${output.title}`,
+      heading,
       "",
       output.content,
     ].join("\n");
@@ -307,6 +363,7 @@ export class WriterAgent extends BaseAgent {
     readonly dialogueFingerprints?: string;
     readonly relevantSummaries?: string;
     readonly parentCanon?: string;
+    readonly language?: "zh" | "en";
   }): string {
     const contextBlock = params.externalContext
       ? `\n## 外部指令\n以下是来自外部系统的创作指令，请在本章中融入：\n\n${params.externalContext}\n`
@@ -346,6 +403,36 @@ export class WriterAgent extends BaseAgent {
 ${params.parentCanon}\n`
       : "";
 
+    if (params.language === "en") {
+      return `Write chapter ${params.chapterNumber}.
+${contextBlock}
+## Current State
+${params.currentState}
+${ledgerBlock}
+## Plot Threads
+${params.hooks}
+${summariesBlock}${subplotBlock}${emotionalBlock}${matrixBlock}${fingerprintBlock}${relevantBlock}${canonBlock}
+## Recent Chapters
+${params.recentChapters || "(This is the first chapter, no previous text)"}
+
+## Worldbuilding
+${params.storyBible}
+
+## Volume Outline (Hard Constraint — Must Follow)
+${params.volumeOutline}
+
+[Outline Rules]
+- This chapter must advance the plot points assigned to it in the volume outline. Do not skip ahead or consume future plot points.
+- If the outline specifies an event for chapter N, do not resolve it early.
+- Pacing must match the outline's chapter span: if 5 chapters are planned for an arc, do not compress into 1-2.
+- PRE_WRITE_CHECK must identify which outline node this chapter covers.
+
+Requirements:
+- Chapter body must be at least ${params.wordCount} words
+- Output PRE_WRITE_CHECK first, then the chapter
+- Output only PRE_WRITE_CHECK, CHAPTER_TITLE, and CHAPTER_CONTENT blocks`;
+    }
+
     return `请续写第${params.chapterNumber}章。
 ${contextBlock}
 ## 当前状态卡
@@ -378,6 +465,7 @@ ${params.volumeOutline}
   private async loadRecentChapters(
     bookDir: string,
     currentChapter: number,
+    count = 1,
   ): Promise<string> {
     const chaptersDir = join(bookDir, "chapters");
     try {
@@ -385,7 +473,7 @@ ${params.volumeOutline}
       const mdFiles = files
         .filter((f) => f.endsWith(".md") && !f.startsWith("index"))
         .sort()
-        .slice(-1);
+        .slice(-count);
 
       if (mdFiles.length === 0) return "";
 
@@ -485,9 +573,10 @@ ${params.volumeOutline}
   private extractDialogueFingerprints(recentChapters: string, _storyBible: string): string {
     if (!recentChapters) return "";
 
-    // Match dialogue patterns: "speaker said" or dialogue in quotes
-    // Chinese dialogue typically uses "" or 「」
-    const dialogueRegex = /(?:(.{1,6})(?:说道|道|喝道|冷声道|笑道|怒道|低声道|大声道|喝骂道|冷笑道|沉声道|喊道|叫道|问道|答道)\s*[：:]\s*["""「]([^"""」]+)["""」])|["""「]([^"""」]{2,})["""」]/g;
+    // Match dialogue patterns:
+    // Chinese: "speaker说道：" or dialogue in ""「」
+    // English: "dialogue," speaker said. or "dialogue."
+    const dialogueRegex = /(?:(.{1,6})(?:说道|道|喝道|冷声道|笑道|怒道|低声道|大声道|喝骂道|冷笑道|沉声道|喊道|叫道|问道|答道)\s*[：:]\s*["""「]([^"""」]+)["""」])|["""「]([^"""」]{2,})["""」]|"([^"]{2,})"/g;
 
     const characterDialogues = new Map<string, string[]>();
     let match: RegExpExecArray | null;

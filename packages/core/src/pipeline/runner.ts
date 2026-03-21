@@ -1,14 +1,16 @@
-import type { LLMClient } from "../llm/provider.js";
+import type { LLMClient, OnStreamProgress } from "../llm/provider.js";
 import { chatCompletion, createLLMClient } from "../llm/provider.js";
-import type { BookConfig } from "../models/book.js";
+import type { Logger } from "../utils/logger.js";
+import type { BookConfig, FanficMode } from "../models/book.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import type { NotifyChannel, LLMConfig, AgentLLMOverride } from "../models/project.js";
 import type { GenreProfile } from "../models/genre-profile.js";
 import { ArchitectAgent } from "../agents/architect.js";
-import { WriterAgent } from "../agents/writer.js";
+import { WriterAgent, type WriteChapterOutput } from "../agents/writer.js";
 import { ChapterAnalyzerAgent } from "../agents/chapter-analyzer.js";
 import { ContinuityAuditor } from "../agents/continuity.js";
 import { ReviserAgent, type ReviseMode } from "../agents/reviser.js";
+import { StateValidatorAgent } from "../agents/state-validator.js";
 import { RadarAgent } from "../agents/radar.js";
 import type { RadarSource } from "../agents/radar-source.js";
 import { readGenreProfile } from "../agents/rules-reader.js";
@@ -32,6 +34,8 @@ export interface PipelineConfig {
   readonly radarSources?: ReadonlyArray<RadarSource>;
   readonly externalContext?: string;
   readonly modelOverrides?: Record<string, string | AgentLLMOverride>;
+  readonly logger?: Logger;
+  readonly onStreamProgress?: OnStreamProgress;
 }
 
 export interface TokenUsageSummary {
@@ -115,6 +119,8 @@ export class PipelineRunner {
       model: this.config.model,
       projectRoot: this.config.projectRoot,
       bookId,
+      logger: this.config.logger,
+      onStreamProgress: this.config.onStreamProgress,
     };
   }
 
@@ -130,23 +136,35 @@ export class PipelineRunner {
     if (!override.baseUrl) {
       return { model: override.model, client: this.config.client };
     }
-    const cacheKey = `${override.baseUrl}:${override.provider ?? "custom"}`;
+    const base = this.config.defaultLLMConfig;
+    const provider = override.provider ?? base?.provider ?? "custom";
+    const apiKeySource = override.apiKeyEnv
+      ? `env:${override.apiKeyEnv}`
+      : `base:${base?.apiKey ?? ""}`;
+    const stream = override.stream ?? base?.stream ?? true;
+    const apiFormat = base?.apiFormat ?? "chat";
+    const cacheKey = [
+      provider,
+      override.baseUrl,
+      apiKeySource,
+      `stream:${stream}`,
+      `format:${apiFormat}`,
+    ].join("|");
     let client = this.agentClients.get(cacheKey);
     if (!client) {
-      const base = this.config.defaultLLMConfig;
       const apiKey = override.apiKeyEnv
         ? process.env[override.apiKeyEnv] ?? ""
         : base?.apiKey ?? "";
       client = createLLMClient({
-        provider: override.provider ?? base?.provider ?? "custom",
+        provider,
         baseUrl: override.baseUrl,
         apiKey,
         model: override.model,
         temperature: base?.temperature ?? 0.7,
         maxTokens: base?.maxTokens ?? 8192,
         thinkingBudget: base?.thinkingBudget ?? 0,
-        apiFormat: base?.apiFormat ?? "chat",
-        stream: override.stream ?? base?.stream ?? true,
+        apiFormat,
+        stream,
       });
       this.agentClients.set(cacheKey, client);
     }
@@ -160,6 +178,8 @@ export class PipelineRunner {
       model,
       projectRoot: this.config.projectRoot,
       bookId,
+      logger: this.config.logger?.child(agent),
+      onStreamProgress: this.config.onStreamProgress,
     };
   }
 
@@ -190,6 +210,54 @@ export class PipelineRunner {
     // Ensure chapters directory exists (prevents ENOENT if init was previously interrupted)
     await mkdir(join(bookDir, "chapters"), { recursive: true });
     await this.state.saveChapterIndex(book.id, []);
+
+    // Snapshot initial state so rewrite of chapter 1 can restore to pre-chapter state
+    await this.state.snapshotState(book.id, 0);
+  }
+
+  /** Import external source material and generate fanfic_canon.md */
+  async importFanficCanon(
+    bookId: string,
+    sourceText: string,
+    sourceName: string,
+    fanficMode: FanficMode,
+  ): Promise<string> {
+    const { FanficCanonImporter } = await import("../agents/fanfic-canon-importer.js");
+    const importer = new FanficCanonImporter(this.agentCtxFor("fanfic-canon-importer", bookId));
+    const result = await importer.importFromText(sourceText, sourceName, fanficMode);
+
+    const bookDir = this.state.bookDir(bookId);
+    const storyDir = join(bookDir, "story");
+    await mkdir(storyDir, { recursive: true });
+    await writeFile(join(storyDir, "fanfic_canon.md"), result.fullDocument, "utf-8");
+
+    return result.fullDocument;
+  }
+
+  /** One-step fanfic book creation: create book + import canon + generate foundation */
+  async initFanficBook(
+    book: BookConfig,
+    sourceText: string,
+    sourceName: string,
+    fanficMode: FanficMode,
+  ): Promise<void> {
+    const bookDir = this.state.bookDir(book.id);
+
+    await this.state.saveBookConfig(book.id, book);
+
+    // Step 1: Import source material → fanfic_canon.md
+    const fanficCanon = await this.importFanficCanon(book.id, sourceText, sourceName, fanficMode);
+
+    // Step 2: Generate foundation from fanfic canon (not from scratch)
+    const architect = new ArchitectAgent(this.agentCtxFor("architect", book.id));
+    const { profile: gp } = await this.loadGenreProfile(book.genre);
+    const foundation = await architect.generateFanficFoundation(book, fanficCanon, fanficMode);
+    await architect.writeFoundationFiles(bookDir, foundation, gp.numericalSystem);
+
+    // Step 3: Initialize chapters directory + snapshot
+    await mkdir(join(bookDir, "chapters"), { recursive: true });
+    await this.state.saveChapterIndex(book.id, []);
+    await this.state.snapshotState(book.id, 0);
   }
 
   /** Write a single draft chapter. Saves chapter file + truth files + index + snapshot. */
@@ -218,10 +286,14 @@ export class PipelineRunner {
       const filename = `${paddedNum}_${sanitized}.md`;
       const filePath = join(chaptersDir, filename);
 
-      await writeFile(filePath, `# 第${chapterNumber}章 ${output.title}\n\n${output.content}`, "utf-8");
+      const resolvedLang = book.language ?? gp.language;
+      const heading = resolvedLang === "en"
+        ? `# Chapter ${chapterNumber}: ${output.title}`
+        : `# 第${chapterNumber}章 ${output.title}`;
+      await writeFile(filePath, `${heading}\n\n${output.content}`, "utf-8");
 
       // Save truth files
-      await writer.saveChapter(bookDir, output, gp.numericalSystem);
+      await writer.saveChapter(bookDir, output, gp.numericalSystem, resolvedLang);
       await writer.saveNewTruthFiles(bookDir, output);
 
       // Update index
@@ -352,9 +424,13 @@ export class PipelineRunner {
       if (!existingFile) {
         throw new Error(`Chapter ${targetChapter} file not found in ${chaptersDir} (expected filename starting with ${paddedNum})`);
       }
+      const reviseLang = book.language ?? gp.language;
+      const reviseHeading = reviseLang === "en"
+        ? `# Chapter ${targetChapter}: ${chapterMeta.title}`
+        : `# 第${targetChapter}章 ${chapterMeta.title}`;
       await writeFile(
         join(chaptersDir, existingFile),
-        `# 第${targetChapter}章 ${chapterMeta.title}\n\n${reviseOutput.revisedContent}`,
+        `${reviseHeading}\n\n${reviseOutput.revisedContent}`,
         "utf-8",
       );
 
@@ -485,8 +561,8 @@ export class PipelineRunner {
     let revised = false;
 
     if (output.postWriteErrors.length > 0) {
-      process.stderr.write(
-        `[pipeline] ${output.postWriteErrors.length} post-write errors detected, triggering spot-fix before audit\n`,
+      this.config.logger?.warn(
+        `${output.postWriteErrors.length} post-write errors detected, triggering spot-fix before audit`,
       );
       const reviser = new ReviserAgent(this.agentCtxFor("reviser", bookId));
       const spotFixIssues = output.postWriteErrors.map((v) => ({
@@ -538,7 +614,7 @@ export class PipelineRunner {
         const reviser = new ReviserAgent(this.agentCtxFor("reviser", bookId));
         const reviseOutput = await reviser.reviseChapter(
           bookDir,
-          output.content,
+          finalContent,
           chapterNumber,
           auditResult.issues,
           "spot-fix",
@@ -548,7 +624,7 @@ export class PipelineRunner {
 
         if (reviseOutput.revisedContent.length > 0) {
           // Guard: reject revision if AI markers increased
-          const preMarkers = analyzeAITells(output.content);
+          const preMarkers = analyzeAITells(finalContent);
           const postMarkers = analyzeAITells(reviseOutput.revisedContent);
           const preCount = preMarkers.issues.length;
           const postCount = postMarkers.issues.length;
@@ -578,48 +654,55 @@ export class PipelineRunner {
             issues: [...reAudit.issues, ...reAITells.issues, ...reSensitive.issues],
             summary: reAudit.summary,
           };
-
-          // Update state files from revision
-          const storyDir = join(bookDir, "story");
-          if (reviseOutput.updatedState !== "(状态卡未更新)") {
-            await writeFile(join(storyDir, "current_state.md"), reviseOutput.updatedState, "utf-8");
-          }
-          if (gp.numericalSystem && reviseOutput.updatedLedger && reviseOutput.updatedLedger !== "(账本未更新)") {
-            await writeFile(join(storyDir, "particle_ledger.md"), reviseOutput.updatedLedger, "utf-8");
-          }
-          if (reviseOutput.updatedHooks !== "(伏笔池未更新)") {
-            await writeFile(join(storyDir, "pending_hooks.md"), reviseOutput.updatedHooks, "utf-8");
-          }
         }
       }
     }
 
-    // 4. Save chapter (original or revised)
-    const chaptersDir = join(bookDir, "chapters");
-    const paddedNum = String(chapterNumber).padStart(4, "0");
-    const title = output.title;
-    const filename = `${paddedNum}_${title.replace(/[/\\?%*:|"<>]/g, "").replace(/\s+/g, "_").slice(0, 50)}.md`;
-
-    await writeFile(
-      join(chaptersDir, filename),
-      `# 第${chapterNumber}章 ${title}\n\n${finalContent}`,
-      "utf-8",
+    // 4. Save the final chapter and truth files from a single persistence source
+    const persistenceOutput = await this.buildPersistenceOutput(
+      bookId,
+      book,
+      bookDir,
+      chapterNumber,
+      output,
+      finalContent,
     );
+    finalWordCount = persistenceOutput.wordCount;
+    const pipelineLang = book.language ?? gp.language;
 
-    // Save original state files if not revised
-    if (!revised) {
-      await writer.saveChapter(bookDir, output, gp.numericalSystem);
+    // 4.1 Validate settler output before writing (non-blocking)
+    try {
+      const storyDir = join(bookDir, "story");
+      const [oldState, oldHooks] = await Promise.all([
+        readFile(join(storyDir, "current_state.md"), "utf-8").catch(() => ""),
+        readFile(join(storyDir, "pending_hooks.md"), "utf-8").catch(() => ""),
+      ]);
+      const validator = new StateValidatorAgent(this.agentCtxFor("state-validator", bookId));
+      const validation = await validator.validate(
+        finalContent, chapterNumber,
+        oldState, persistenceOutput.updatedState,
+        oldHooks, persistenceOutput.updatedHooks,
+        pipelineLang,
+      );
+      if (validation.warnings.length > 0) {
+        this.config.logger?.warn(`State validation: ${validation.warnings.length} warning(s) for chapter ${chapterNumber}`);
+        for (const w of validation.warnings) {
+          this.config.logger?.warn(`  [${w.category}] ${w.description}`);
+        }
+      }
+    } catch (e) {
+      this.config.logger?.warn(`State validation skipped: ${e}`);
     }
 
-    // Save new truth files (summaries, subplots, emotional arcs, character matrix)
-    await writer.saveNewTruthFiles(bookDir, output);
+    await writer.saveChapter(bookDir, persistenceOutput, gp.numericalSystem, pipelineLang);
+    await writer.saveNewTruthFiles(bookDir, persistenceOutput);
 
     // 5. Update chapter index
     const existingIndex = await this.state.loadChapterIndex(bookId);
     const now = new Date().toISOString();
     const newEntry: ChapterMeta = {
       number: chapterNumber,
-      title: output.title,
+      title: persistenceOutput.title,
       status: auditResult.passed ? "ready-for-review" : "audit-failed",
       wordCount: finalWordCount,
       createdAt: now,
@@ -631,7 +714,39 @@ export class PipelineRunner {
     };
     await this.state.saveChapterIndex(bookId, [...existingIndex, newEntry]);
 
-    // 5.5 Snapshot state for rollback support
+    // 5.5 Audit drift correction — feed audit findings back into state
+    // This prevents the writer from repeating mistakes in the next chapter
+    const driftIssues = auditResult.issues.filter(
+      (i) => i.severity === "critical" || i.severity === "warning",
+    );
+    if (driftIssues.length > 0) {
+      const storyDir = join(bookDir, "story");
+      try {
+        const statePath = join(storyDir, "current_state.md");
+        const currentState = await readFile(statePath, "utf-8").catch(() => "");
+
+        // Append drift correction section (or replace existing one)
+        const correctionHeader = "## 审计纠偏（自动生成，下一章写作前参照）";
+        const correctionBlock = [
+          correctionHeader,
+          `> 第${chapterNumber}章审计发现以下问题，下一章写作时必须避免：`,
+          ...driftIssues.map((i) => `> - [${i.severity}] ${i.category}: ${i.description}`),
+          "",
+        ].join("\n");
+
+        // Replace existing correction block or append
+        const existingCorrectionIdx = currentState.indexOf(correctionHeader);
+        const updatedState = existingCorrectionIdx >= 0
+          ? currentState.slice(0, existingCorrectionIdx) + correctionBlock
+          : currentState + "\n\n" + correctionBlock;
+
+        await writeFile(statePath, updatedState, "utf-8");
+      } catch {
+        // Non-critical — don't block pipeline if drift correction fails
+      }
+    }
+
+    // 5.6 Snapshot state for rollback support
     await this.state.snapshotState(bookId, chapterNumber);
 
     // 6. Send notification
@@ -640,7 +755,7 @@ export class PipelineRunner {
       await dispatchNotification(this.config.notifyChannels, {
         title: `${statusEmoji} ${book.title} 第${chapterNumber}章`,
         body: [
-          `**${output.title}** | ${finalWordCount}字`,
+          `**${persistenceOutput.title}** | ${finalWordCount}字`,
           revised ? "📝 已自动修正" : "",
           `审稿: ${auditResult.passed ? "通过" : "需人工审核"}`,
           ...auditResult.issues
@@ -653,7 +768,7 @@ export class PipelineRunner {
     }
 
     await this.emitWebhook("pipeline-complete", bookId, chapterNumber, {
-      title: output.title,
+      title: persistenceOutput.title,
       wordCount: finalWordCount,
       passed: auditResult.passed,
       revised,
@@ -661,7 +776,7 @@ export class PipelineRunner {
 
     return {
       chapterNumber,
-      title: output.title,
+      title: persistenceOutput.title,
       wordCount: finalWordCount,
       auditResult,
       revised,
@@ -888,9 +1003,11 @@ ${matrix}`,
 
       const startFrom = input.resumeFrom ?? 1;
 
+      const log = this.config.logger?.child("import");
+
       // Step 1: Generate foundation on first run (not on resume)
       if (startFrom === 1) {
-        process.stderr.write(`[import] Step 1: Generating foundation from ${input.chapters.length} chapters...\n`);
+        log?.info(`Step 1: Generating foundation from ${input.chapters.length} chapters...`);
         const allText = input.chapters.map((c, i) =>
           `第${i + 1}章 ${c.title}\n\n${c.content}`,
         ).join("\n\n---\n\n");
@@ -899,20 +1016,21 @@ ${matrix}`,
         const foundation = await architect.generateFoundationFromImport(book, allText);
         await architect.writeFoundationFiles(bookDir, foundation, gp.numericalSystem);
         await this.state.saveChapterIndex(input.bookId, []);
-        process.stderr.write(`[import] Foundation generated.\n`);
+        log?.info("Foundation generated.");
       }
 
       // Step 2: Sequential replay
-      process.stderr.write(`[import] Step 2: Sequential replay from chapter ${startFrom}...\n`);
+      log?.info(`Step 2: Sequential replay from chapter ${startFrom}...`);
       const analyzer = new ChapterAnalyzerAgent(this.agentCtxFor("chapter-analyzer", input.bookId));
       const writer = new WriterAgent(this.agentCtxFor("writer", input.bookId));
       let totalWords = 0;
+      let importedCount = 0;
 
       for (let i = startFrom - 1; i < input.chapters.length; i++) {
         const ch = input.chapters[i]!;
         const chapterNumber = i + 1;
 
-        process.stderr.write(`[import] Analyzing chapter ${chapterNumber}/${input.chapters.length}: ${ch.title}...\n`);
+        log?.info(`Analyzing chapter ${chapterNumber}/${input.chapters.length}: ${ch.title}...`);
 
         // Analyze chapter to get truth file updates
         const output = await analyzer.analyzeChapter({
@@ -959,15 +1077,16 @@ ${matrix}`,
         // Snapshot state after each chapter for rollback + resume support
         await this.state.snapshotState(input.bookId, chapterNumber);
 
+        importedCount++;
         totalWords += ch.content.length;
       }
 
       const nextChapter = input.chapters.length + 1;
-      process.stderr.write(`[import] Done. ${input.chapters.length} chapters imported, ${totalWords} chars. Next chapter: ${nextChapter}\n`);
+      log?.info(`Done. ${importedCount} chapters imported, ${totalWords} chars. Next chapter: ${nextChapter}`);
 
       return {
         bookId: input.bookId,
-        importedCount: input.chapters.length,
+        importedCount,
         totalWords,
         nextChapter,
       };
@@ -985,6 +1104,35 @@ ${matrix}`,
       promptTokens: a.promptTokens + b.promptTokens,
       completionTokens: a.completionTokens + b.completionTokens,
       totalTokens: a.totalTokens + b.totalTokens,
+    };
+  }
+
+  private async buildPersistenceOutput(
+    bookId: string,
+    book: BookConfig,
+    bookDir: string,
+    chapterNumber: number,
+    output: WriteChapterOutput,
+    finalContent: string,
+  ): Promise<WriteChapterOutput> {
+    if (finalContent === output.content) {
+      return output;
+    }
+
+    const analyzer = new ChapterAnalyzerAgent(this.agentCtxFor("chapter-analyzer", bookId));
+    const analyzed = await analyzer.analyzeChapter({
+      book,
+      bookDir,
+      chapterNumber,
+      chapterContent: finalContent,
+      chapterTitle: output.title,
+    });
+
+    return {
+      ...analyzed,
+      postWriteErrors: [],
+      postWriteWarnings: [],
+      tokenUsage: output.tokenUsage,
     };
   }
 

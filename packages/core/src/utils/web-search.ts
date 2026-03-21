@@ -1,10 +1,52 @@
 /**
- * URL fetch utility for agent loop.
+ * Web search + URL fetch utilities.
  *
- * Web search is handled natively by the LLM provider (OpenAI web_search_preview
- * or web_search_options). This module only provides URL fetching for cases where
- * the agent loop needs to read a specific page.
+ * searchWeb(): Tavily API search (requires TAVILY_API_KEY env var).
+ * fetchUrl(): Fetch a specific URL and return plain text.
  */
+
+export interface SearchResult {
+  readonly title: string;
+  readonly url: string;
+  readonly snippet: string;
+}
+
+/**
+ * Search the web via Tavily API.
+ * Requires TAVILY_API_KEY environment variable.
+ * Throws if key is not set — caller should catch and fall back to regular chat.
+ */
+export async function searchWeb(query: string, maxResults = 5): Promise<ReadonlyArray<SearchResult>> {
+  const apiKey = process.env.TAVILY_API_KEY;
+  if (!apiKey) {
+    throw new Error("TAVILY_API_KEY not set. Set this env var to enable web search, or use OpenAI which has native search.");
+  }
+
+  const res = await fetch("https://api.tavily.com/search", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      api_key: apiKey,
+      query,
+      max_results: maxResults,
+      search_depth: "basic",
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Tavily search failed: ${res.status} ${await res.text().catch(() => "")}`);
+  }
+
+  const data = await res.json() as { results?: Array<{ title?: string; url?: string; content?: string }> };
+  return (data.results ?? []).map((r) => ({
+    title: r.title ?? "",
+    url: r.url ?? "",
+    snippet: r.content ?? "",
+  }));
+}
 
 /**
  * Fetch a URL and return its text content.
@@ -26,7 +68,6 @@ export async function fetchUrl(url: string, maxChars = 8000): Promise<string> {
   const contentType = res.headers.get("content-type") ?? "";
   const text = await res.text();
 
-  // If HTML, strip tags and collapse whitespace
   if (contentType.includes("html")) {
     return text
       .replace(/<script[\s\S]*?<\/script>/gi, "")

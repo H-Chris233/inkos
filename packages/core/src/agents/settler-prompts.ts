@@ -6,7 +6,10 @@ export function buildSettlerSystemPrompt(
   book: BookConfig,
   genreProfile: GenreProfile,
   bookRules: BookRules | null,
+  language?: "zh" | "en",
 ): string {
+  const resolvedLang = language ?? genreProfile.language;
+  const isEnglish = resolvedLang === "en";
   const numericalBlock = genreProfile.numericalSystem
     ? `\n- 本题材有数值/资源体系，你必须在 UPDATED_LEDGER 中追踪正文中出现的所有资源变动
 - 数值验算铁律：期初 + 增量 = 期末，三项必须可验算`
@@ -24,7 +27,11 @@ export function buildSettlerSystemPrompt(
     ? `\n## 全员追踪\nPOST_SETTLEMENT 必须额外包含：本章出场角色清单、角色间关系变动、未出场但被提及的角色。`
     : "";
 
-  return `你是状态追踪分析师。给定新章节正文和当前 truth 文件，你的任务是产出更新后的 truth 文件。
+  const langPrefix = isEnglish
+    ? `【LANGUAGE OVERRIDE】ALL output (state card, hooks, summaries, subplots, emotional arcs, character matrix) MUST be in English. The === TAG === markers remain unchanged.\n\n`
+    : "";
+
+  return `${langPrefix}你是状态追踪分析师。给定新章节正文和当前 truth 文件，你的任务是产出更新后的 truth 文件。
 
 ## 工作模式
 
@@ -135,6 +142,7 @@ export function buildSettlerUserPrompt(params: {
   readonly emotionalArcs: string;
   readonly characterMatrix: string;
   readonly volumeOutline: string;
+  readonly observations?: string;
 }): string {
   const ledgerBlock = params.ledger
     ? `\n## 当前资源账本\n${params.ledger}\n`
@@ -156,8 +164,12 @@ export function buildSettlerUserPrompt(params: {
     ? `\n## 当前角色交互矩阵\n${params.characterMatrix}\n`
     : "";
 
-  return `请分析第${params.chapterNumber}章「${params.title}」的正文，更新所有追踪文件。
+  const observationsBlock = params.observations
+    ? `\n## 观察日志（由 Observer 提取，包含本章所有事实变化）\n${params.observations}\n\n基于以上观察日志和正文，更新所有追踪文件。确保观察日志中的每一项变化都反映在对应的文件中。\n`
+    : "";
 
+  return `请分析第${params.chapterNumber}章「${params.title}」的正文，更新所有追踪文件。
+${observationsBlock}
 ## 本章正文
 
 ${params.content}

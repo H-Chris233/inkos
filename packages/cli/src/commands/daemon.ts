@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { Scheduler } from "@actalk/inkos-core";
 import { loadConfig, findProjectRoot, buildPipelineConfig, log, logError } from "../utils.js";
+import { createWriteStream, type WriteStream } from "node:fs";
 import { writeFile, readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -8,13 +9,16 @@ const PID_FILE = "inkos.pid";
 
 export const upCommand = new Command("up")
   .description("Start the InkOS daemon (autonomous mode)")
-  .action(async () => {
+  .option("-q, --quiet", "Suppress console output")
+  .action(async (opts) => {
+    let logStream: WriteStream | undefined;
+    let pidPath: string | undefined;
     try {
       const config = await loadConfig();
       const root = findProjectRoot();
 
       // Check if already running
-      const pidPath = join(root, PID_FILE);
+      pidPath = join(root, PID_FILE);
       try {
         const existingPid = await readFile(pidPath, "utf-8");
         logError(`Daemon already running (PID: ${existingPid.trim()}). Run 'inkos down' first.`);
@@ -32,8 +36,12 @@ export const upCommand = new Command("up")
       // Write PID file
       await writeFile(pidPath, String(process.pid), "utf-8");
 
+      // File logging for daemon
+      const logPath = join(root, "inkos.log");
+      logStream = createWriteStream(logPath, { flags: "a" });
+
       const scheduler = new Scheduler({
-        ...buildPipelineConfig(config, root),
+        ...buildPipelineConfig(config, root, { logFile: logStream, quiet: opts.quiet }),
         radarCron: config.daemon.schedule.radarCron,
         writeCron: config.daemon.schedule.writeCron,
         maxConcurrentBooks: config.daemon.maxConcurrentBooks,
@@ -54,10 +62,14 @@ export const upCommand = new Command("up")
       const shutdown = async () => {
         log("\nShutting down daemon...");
         scheduler.stop();
-        try {
-          await unlink(pidPath);
-        } catch {
-          // ignore
+        logStream?.end();
+        const currentPidPath = pidPath;
+        if (currentPidPath !== undefined) {
+          try {
+            await unlink(currentPidPath);
+          } catch {
+            // ignore
+          }
         }
         process.exit(0);
       };
@@ -71,6 +83,14 @@ export const upCommand = new Command("up")
       // Keep process alive
       await new Promise(() => {});
     } catch (e) {
+      logStream?.end();
+      if (pidPath !== undefined) {
+        try {
+          await unlink(pidPath);
+        } catch {
+          // ignore
+        }
+      }
       logError(`Failed to start daemon: ${e}`);
       process.exit(1);
     }
