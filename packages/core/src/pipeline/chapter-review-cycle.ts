@@ -30,7 +30,7 @@ export interface ChapterReviewCycleResult {
   readonly normalizeApplied: boolean;
 }
 
-const MAX_REVIEW_ITERATIONS = 1;
+const DEFAULT_MAX_REVIEW_ITERATIONS = 1;
 const PASS_SCORE_THRESHOLD = 85;
 const NET_IMPROVEMENT_EPSILON = 3;
 
@@ -101,6 +101,7 @@ export async function runChapterReviewCycle(params: {
   };
   /** Re-run deterministic post-write checks (chapter-ref, paragraph shape, etc.) on any content. */
   readonly runPostWriteChecks?: (content: string) => ReadonlyArray<AuditIssue>;
+  readonly maxReviewIterations?: number;
   readonly logWarn: (message: { zh: string; en: string }) => void;
   readonly logStage: (message: { zh: string; en: string }) => void;
 }): Promise<ChapterReviewCycleResult> {
@@ -197,8 +198,10 @@ export async function runChapterReviewCycle(params: {
     assessment.auditResult.passed && assessment.score >= PASS_SCORE_THRESHOLD && assessment.lengthInRange;
 
   // ---------------------------------------------------------------------------
-  // Scoring loop: assess → revise → assess, one automatic repair pass max.
+  // Scoring loop: assess → revise → assess. Default is one automatic repair pass;
+  // projects can raise it when they accept slower but more persistent repair.
   // ---------------------------------------------------------------------------
+  const maxReviewIterations = Math.max(0, Math.floor(params.maxReviewIterations ?? DEFAULT_MAX_REVIEW_ITERATIONS));
   params.logStage({ zh: "审计草稿", en: "auditing draft" });
   const initial = await assess(finalContent);
 
@@ -213,10 +216,10 @@ export async function runChapterReviewCycle(params: {
   let postReviseCount = 0;
 
   if (!isPassed(initial)) {
-    for (let iteration = 0; iteration < MAX_REVIEW_ITERATIONS; iteration++) {
+    for (let iteration = 0; iteration < maxReviewIterations; iteration++) {
       params.logStage({
-        zh: `修复轮次 ${iteration + 1}/${MAX_REVIEW_ITERATIONS}（当前 ${currentAudit.score} 分）`,
-        en: `repair iteration ${iteration + 1}/${MAX_REVIEW_ITERATIONS} (current score: ${currentAudit.score})`,
+        zh: `修复轮次 ${iteration + 1}/${maxReviewIterations}（当前 ${currentAudit.score} 分）`,
+        en: `repair iteration ${iteration + 1}/${maxReviewIterations} (current score: ${currentAudit.score})`,
       });
 
       const reviser = params.createReviser();

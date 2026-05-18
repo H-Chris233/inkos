@@ -2387,6 +2387,31 @@ describe("createStudioServer daemon lifecycle", () => {
     );
   });
 
+  it("passes configured long-form writing review retries into Studio write-next", async () => {
+    await writeFile(
+      join(root, "inkos.json"),
+      JSON.stringify({
+        ...cloneProjectConfig(),
+        writing: { reviewRetries: 3 },
+      }, null, 2),
+      "utf-8",
+    );
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/books/demo-book/write-next", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    expect(response.status).toBe(200);
+    expect(pipelineConfigs.at(-1)).toEqual(expect.objectContaining({
+      writingReviewRetries: 3,
+    }));
+  });
+
   it("handles explicit chat chapter edits outside the InkOS writing agent", async () => {
     loadChapterIndexMock.mockResolvedValueOnce([{
       number: 3,
