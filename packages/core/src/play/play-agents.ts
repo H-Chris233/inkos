@@ -89,7 +89,36 @@ export class PlayWorldMutatorAgent extends BaseAgent {
           blocked: true,
           blockedReason: "模型输出无法解析为有效的状态变更，本回合未推进世界状态。",
         });
+    // Observability (#2): a dropped world item must not vanish silently. Log when
+    // the model proposed entities/edges/slots that parsing discarded — that is the
+    // difference between "the model wrote nothing" and "we threw its work away".
+    logDroppedMutationItems(raw, mutation, input.turn);
     return { ...mutation, eventId: mutation.eventId || `evt-${input.turn}` };
+  }
+}
+
+function rawUpsertCount(field: unknown): number {
+  if (Array.isArray(field)) return field.length;
+  if (field && typeof field === "object" && Array.isArray((field as { upsert?: unknown }).upsert)) {
+    return (field as { upsert: unknown[] }).upsert.length;
+  }
+  return 0;
+}
+
+function logDroppedMutationItems(raw: unknown, mutation: PlayMutation, turn: number): void {
+  if (!raw || typeof raw !== "object") return;
+  const r = raw as Record<string, unknown>;
+  const rawE = rawUpsertCount(r.entities);
+  const rawEd = rawUpsertCount(r.edges);
+  const rawS = rawUpsertCount(r.stateSlots);
+  const keptE = mutation.entities.upsert.length;
+  const keptEd = mutation.edges.upsert.length;
+  const keptS = mutation.stateSlots.upsert.length;
+  if (rawE > keptE || rawEd > keptEd || rawS > keptS) {
+    // eslint-disable-next-line no-console -- intentional degradation observability
+    console.warn(
+      `[play-mutator] turn ${turn}: dropped malformed items — entities ${rawE}->${keptE}, edges ${rawEd}->${keptEd}, slots ${rawS}->${keptS}`,
+    );
   }
 }
 
@@ -170,6 +199,8 @@ function buildWorldMutatorSystemPrompt(language: "zh" | "en"): string {
       "Only use evidence.transitions for the evidence lifecycle when this world is genuinely an investigation/mystery; otherwise leave it empty.",
       "If the player's action is invalid or information is insufficient, set blocked=true and write blockedReason.",
       "Output strict JSON matching PlayMutation: eventId, turn, actionKind, summary, entities, edges, stateSlots, evidence, blocked, blockedReason, notes.",
+      "Here is a complete example — produce this shape: every entity MUST have id/type/label, and tangible clues go into entities like this, never only into summary:",
+      `{"eventId":"evt-1","turn":1,"actionKind":"look","summary":"The detective checks the body and finds half a boat ticket and a warehouse key.","entities":{"upsert":[{"id":"evidence_half_ticket","type":"evidence","label":"half boat ticket","summary":"Clutched in the dead man's right hand; route and date partly torn off.","status":"seen","updatedEventId":"evt-1"},{"id":"item_brass_key","type":"item","label":"brass key","summary":"Old three-tooth lock type, stamped 'Warehouse B-7'.","status":"collected","updatedEventId":"evt-1"}]},"stateSlots":{"upsert":[{"id":"slot_deadline","kind":"timer","label":"case deadline","value":3,"updatedEventId":"evt-1"}]}}`,
     ].join("\n");
   }
   return [
@@ -187,6 +218,8 @@ function buildWorldMutatorSystemPrompt(language: "zh" | "en"): string {
     "只有当这个世界确实是调查/推理题材时，才用 evidence.transitions 走证据生命周期；其他题材留空即可。",
     "如果玩家动作无效或信息不足，blocked=true 并写 blockedReason。",
     "输出严格 JSON，必须符合 PlayMutation：eventId, turn, actionKind, summary, entities, edges, stateSlots, evidence, blocked, blockedReason, notes。",
+    "下面是一个完整范例，照此结构产出——每个 entity 必须带 id/type/label，实物线索这样进 entities，绝不能只写进 summary：",
+    `{"eventId":"evt-1","turn":1,"actionKind":"look","summary":"周野检查死者随身物，发现半张船票与一把仓库钥匙。","entities":{"upsert":[{"id":"evidence_half_ticket","type":"evidence","label":"半张船票","summary":"死者右手攥着，残留沪—甬航线与196_日期，撕口是手指扯断。","status":"seen","updatedEventId":"evt-1"},{"id":"item_brass_key","type":"item","label":"黄铜钥匙","summary":"旧式三齿一槽锁型，柄上刻浦发仓库B-7。","status":"collected","updatedEventId":"evt-1"}]},"stateSlots":{"upsert":[{"id":"slot_deadline","kind":"timer","label":"结案倒计时","value":3,"updatedEventId":"evt-1"}]}}`,
   ].join("\n");
 }
 

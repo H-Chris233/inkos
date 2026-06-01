@@ -218,6 +218,26 @@ describe("play models", () => {
     expect(mutation.edges.upsert[0]?.id).toBe("edge_good");
   });
 
+  it("backfills a missing id from the label so a labeled entity/slot survives instead of vanishing", () => {
+    const mutation = PlayMutationSchema.parse({
+      eventId: "evt-7",
+      turn: 7,
+      actionKind: "look",
+      // Model wrote a complete entity/slot but forgot the boilerplate id — must be kept, not dropped.
+      entities: [
+        { type: "evidence", label: "半张船票", summary: "死者攥着", status: "seen", updatedEventId: "evt-7" },
+      ],
+      stateSlots: [
+        { kind: "timer", label: "结案倒计时", value: 3, updatedEventId: "evt-7" },
+      ],
+    });
+    expect(mutation.entities.upsert).toHaveLength(1);
+    expect(mutation.entities.upsert[0]?.label).toBe("半张船票");
+    expect(mutation.entities.upsert[0]?.id).toContain("ent_");
+    expect(mutation.stateSlots.upsert).toHaveLength(1);
+    expect(mutation.stateSlots.upsert[0]?.id).toContain("slot_");
+  });
+
   it("never throws on a structurally-wrong mutation — every off-shape field degrades", () => {
     const mutation = PlayMutationSchema.parse({
       eventId: "evt-9",

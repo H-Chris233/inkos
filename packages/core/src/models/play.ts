@@ -147,6 +147,28 @@ export type PlayEvent = z.infer<typeof PlayEventSchema>;
 // string fields, and produce individual entities/edges/slots that are incomplete. Normalize the
 // container shape, accept null reasons, and parse each item leniently — dropping malformed items
 // rather than failing the whole mutation — so one bad item from the model doesn't crash a play turn.
+// Models routinely emit a well-formed entity/slot but forget the required `id`
+// (they write type+label+summary and skip the boilerplate id). Without this the
+// item is silently dropped and the world graph stays empty. Backfill a stable id
+// from the label so the model's actual work survives instead of vanishing.
+function slugifyId(prefix: string, value: unknown, index: number): string {
+  const base = typeof value === "string" ? value.trim().replace(/\s+/g, "_") : "";
+  return `${prefix}_${base ? base.slice(0, 30) : `x${index}`}`;
+}
+
+function backfillUpsertIds(container: unknown, prefix: string, labelKey: string): unknown {
+  if (!container || typeof container !== "object" || Array.isArray(container)) return container;
+  const c = container as Record<string, unknown>;
+  if (!Array.isArray(c.upsert)) return c;
+  c.upsert = c.upsert.map((item, i) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+    const obj = item as Record<string, unknown>;
+    if (typeof obj.id === "string" && obj.id.trim().length > 0) return obj;
+    return { ...obj, id: slugifyId(prefix, obj[labelKey], i) };
+  });
+  return c;
+}
+
 function normalizePlayMutation(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
   const v = { ...(value as Record<string, unknown>) };
@@ -155,6 +177,9 @@ function normalizePlayMutation(value: unknown): unknown {
   if (Array.isArray(v.stateSlots)) v.stateSlots = { upsert: v.stateSlots };
   if (Array.isArray(v.evidence)) v.evidence = { transitions: v.evidence };
   if (typeof v.notes === "string") v.notes = v.notes.trim() ? [v.notes] : [];
+  v.entities = backfillUpsertIds(v.entities, "ent", "label");
+  v.stateSlots = backfillUpsertIds(v.stateSlots, "slot", "label");
+  v.edges = backfillUpsertIds(v.edges, "edge", "type");
   return v;
 }
 
