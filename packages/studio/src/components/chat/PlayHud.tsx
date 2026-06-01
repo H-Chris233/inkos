@@ -13,6 +13,7 @@ interface PlayEntity {
   readonly label: string;
   readonly summary?: string;
   readonly status?: string;
+  readonly imageUrl?: string;
 }
 interface PlayEdge {
   readonly id: string;
@@ -40,10 +41,21 @@ interface PlayGraph {
   readonly stateSlots: ReadonlyArray<PlayStateSlot>;
   readonly events: ReadonlyArray<PlayEvent>;
 }
+interface PlayImageSettings {
+  readonly actors: boolean;
+  readonly moments: boolean;
+  readonly inventory: boolean;
+}
 interface PlayRunResponse {
   readonly title?: string;
   readonly currentState?: { turn?: number; mode?: string; premise?: string } | null;
   readonly graph?: PlayGraph;
+  readonly imageSettings?: PlayImageSettings;
+  readonly sceneImageUrl?: string;
+}
+interface CoverConfigResponse {
+  readonly service?: string | null;
+  readonly providers?: ReadonlyArray<{ readonly service: string; readonly connected?: boolean }>;
 }
 
 const HOLDING_TYPES = new Set(["item", "evidence", "clue", "claim", "proof_chain"]);
@@ -79,12 +91,16 @@ interface HudRow {
   // Extra info shown when the row is expanded (summary, relationships, why a
   // meter changed). A row is expandable only when this is non-empty.
   readonly details: ReadonlyArray<HudDetail>;
+  // Generated illustration for this entity (actor portrait / item still), if any.
+  readonly imageUrl?: string;
 }
 interface HudView {
   readonly turn: number | null;
   readonly mode: string | null;
   readonly premise: string;
   readonly facing: ReadonlyArray<HudRow>;
+  // Actor subset of `facing` (excludes locations) — only actors auto-illustrate.
+  readonly actors: ReadonlyArray<HudRow>;
   readonly holdings: ReadonlyArray<HudRow>;
   readonly meters: ReadonlyArray<HudRow>;
 }
@@ -119,6 +135,7 @@ function buildView(run: PlayRunResponse | null): HudView | null {
       label: e.label,
       note: e.status ?? null,
       details: [...summaryDetail(e), ...relationDetails(e.id)],
+      imageUrl: e.imageUrl,
     }));
   const holdings: HudRow[] = entities
     .filter((e) => HOLDING_TYPES.has(e.type))
@@ -128,6 +145,7 @@ function buildView(run: PlayRunResponse | null): HudView | null {
       label: e.label,
       note: e.status ?? null,
       details: summaryDetail(e),
+      imageUrl: e.imageUrl,
     }));
   const meters: HudRow[] = stateSlots.map((slot) => {
     const cause = slot.updatedEventId ? outcomeOf.get(slot.updatedEventId) || "" : "";
@@ -147,6 +165,7 @@ function buildView(run: PlayRunResponse | null): HudView | null {
     mode: run.currentState?.mode ?? null,
     premise: run.currentState?.premise ?? "",
     facing: [...locations, ...actors],
+    actors,
     holdings,
     meters,
   };
@@ -159,23 +178,29 @@ export function PlayHud(props: {
   readonly sessionTitle?: string | null;
 }) {
   const { sessionId, isStreaming, isZh } = props;
+  const base = `/play/runs/${encodeURIComponent(sessionId)}/main`;
   const [open, setOpen] = useState(true);
   const [run, setRun] = useState<PlayRunResponse | null>(null);
   const [hasUnseen, setHasUnseen] = useState(false);
+  const [settings, setSettings] = useState<PlayImageSettings>({ actors: false, moments: false, inventory: false });
+  const [coverReady, setCoverReady] = useState(false);
+  const [generating, setGenerating] = useState<ReadonlySet<string>>(new Set());
+  const inFlight = useRef<Set<string>>(new Set());
   const openRef = useRef(open);
   const prevStreaming = useRef(isStreaming);
   openRef.current = open;
 
   const load = useCallback(async () => {
     try {
-      const data = await fetchJson<PlayRunResponse>(`/play/runs/${encodeURIComponent(sessionId)}/main`);
+      const data = await fetchJson<PlayRunResponse>(base);
       setRun(data);
+      if (data.imageSettings) setSettings(data.imageSettings);
       if (!openRef.current) setHasUnseen(true);
     } catch {
       // A play session may not have a persisted world yet (no first action).
       // Leaving run null renders the empty state; do not surface an error.
     }
-  }, [sessionId]);
+  }, [base]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -185,7 +210,64 @@ export function PlayHud(props: {
     prevStreaming.current = isStreaming;
   }, [isStreaming, load]);
 
+  // Image toggles can only be enabled once an image API is configured + connected.
+  useEffect(() => {
+    fetchJson<CoverConfigResponse>("/cover/config")
+      .then((cfg) => {
+        const selected = cfg.service ?? null;
+        setCoverReady(!!selected && (cfg.providers ?? []).some((p) => p.service === selected && p.connected));
+      })
+      .catch(() => setCoverReady(false));
+  }, []);
+
+  const toggleSetting = useCallback(async (key: keyof PlayImageSettings) => {
+    const next = { ...settings, [key]: !settings[key] };
+    setSettings(next);
+    try {
+      await fetchJson(`${base}/image-settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(next),
+      });
+    } catch {
+      setSettings(settings); // revert on failure
+    }
+  }, [settings, base]);
+
+  const generate = useCallback(async (
+    key: string,
+    body: { target: "entity"; entityId: string } | { target: "scene" },
+  ) => {
+    if (inFlight.current.has(key)) return;
+    inFlight.current.add(key);
+    setGenerating((s) => new Set(s).add(key));
+    try {
+      await fetchJson(`${base}/generate-image`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      await load();
+    } catch {
+      // Generation blip — the row simply stays image-less; user can retry.
+    } finally {
+      inFlight.current.delete(key);
+      setGenerating((s) => { const n = new Set(s); n.delete(key); return n; });
+    }
+  }, [base, load]);
+
   const view = useMemo(() => buildView(run), [run]);
+
+  // Auto-illustrate new actors / inventory when the toggle is on and an image
+  // API is configured. Decoupled + deduped (inFlight): never blocks a turn,
+  // images appear on the next refresh.
+  useEffect(() => {
+    if (!coverReady || !view) return;
+    const targets: string[] = [];
+    if (settings.actors) view.actors.forEach((r) => { if (!r.imageUrl) targets.push(r.id); });
+    if (settings.inventory) view.holdings.forEach((r) => { if (!r.imageUrl) targets.push(r.id); });
+    targets.forEach((id) => void generate(id, { target: "entity", entityId: id }));
+  }, [coverReady, settings.actors, settings.inventory, view, generate]);
 
   const title = props.sessionTitle?.trim() || run?.title?.trim() || (isZh ? "互动世界" : "Play World");
 
@@ -230,13 +312,20 @@ export function PlayHud(props: {
           </p>
         ) : (
           <>
+            {run?.sceneImageUrl && (
+              <img
+                src={run.sceneImageUrl}
+                alt={isZh ? "本幕配图" : "This moment"}
+                className="w-full rounded-lg border border-border/30 object-cover"
+              />
+            )}
             <Zone
               title={isZh ? "我面对的" : "Around me"}
               empty={view.facing.length === 0}
               emptyText={isZh ? "周围还没有出现地点或人物" : "No places or people around yet"}
             >
               {view.facing.map((row) => (
-                <Row key={row.id} row={row} isZh={isZh} />
+                <Row key={row.id} row={row} isZh={isZh} generating={generating.has(row.id)} />
               ))}
             </Zone>
 
@@ -246,7 +335,7 @@ export function PlayHud(props: {
               emptyText={isZh ? "还没有获得物品、证据或线索" : "No items, evidence, or clues yet"}
             >
               {view.holdings.map((row) => (
-                <Row key={row.id} row={row} isZh={isZh} />
+                <Row key={row.id} row={row} isZh={isZh} generating={generating.has(row.id)} />
               ))}
             </Zone>
 
@@ -265,10 +354,74 @@ export function PlayHud(props: {
                 {view.premise}
               </div>
             )}
+
+            <PlayImagePanel
+              isZh={isZh}
+              settings={settings}
+              coverReady={coverReady}
+              onToggle={toggleSetting}
+              onIllustrateMoment={() => generate("scene", { target: "scene" })}
+              momentBusy={generating.has("scene")}
+            />
           </>
         )}
       </div>
     </aside>
+  );
+}
+
+function PlayImagePanel(props: {
+  readonly isZh: boolean;
+  readonly settings: PlayImageSettings;
+  readonly coverReady: boolean;
+  readonly onToggle: (key: keyof PlayImageSettings) => void;
+  readonly onIllustrateMoment: () => void;
+  readonly momentBusy: boolean;
+}) {
+  const { isZh, settings, coverReady, onToggle, onIllustrateMoment, momentBusy } = props;
+  const options: ReadonlyArray<{ key: keyof PlayImageSettings; label: string }> = [
+    { key: "actors", label: isZh ? "为角色配图" : "Illustrate characters" },
+    { key: "moments", label: isZh ? "为时刻配图" : "Illustrate moments" },
+    { key: "inventory", label: isZh ? "为背包配图" : "Illustrate inventory" },
+  ];
+  return (
+    <section className="border-t border-border/30 pt-3">
+      <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/70">
+        {isZh ? "自动配图" : "Auto illustration"}
+      </h3>
+      <div className="space-y-1.5">
+        {options.map((opt) => (
+          <label
+            key={opt.key}
+            className={`flex items-center gap-2 text-[12px] ${coverReady ? "cursor-pointer text-foreground" : "cursor-not-allowed text-muted-foreground/40"}`}
+            title={coverReady ? undefined : (isZh ? "先在「模型配置」里配好生图 API 才能开启" : "Configure an image API in Model Settings first")}
+          >
+            <input
+              type="checkbox"
+              disabled={!coverReady}
+              checked={coverReady && settings[opt.key]}
+              onChange={() => onToggle(opt.key)}
+              className="h-3.5 w-3.5 accent-primary"
+            />
+            {opt.label}
+          </label>
+        ))}
+      </div>
+      {!coverReady ? (
+        <p className="mt-2 text-[11px] leading-4 text-muted-foreground/50">
+          {isZh ? "未检测到可用的生图 API。在「模型配置」里配好后即可勾选。" : "No image API configured. Set one up in Model Settings to enable."}
+        </p>
+      ) : settings.moments ? (
+        <button
+          type="button"
+          onClick={onIllustrateMoment}
+          disabled={momentBusy}
+          className="mt-2 w-full rounded-lg border border-border/40 bg-secondary/40 px-2.5 py-1.5 text-[12px] font-medium text-foreground hover:text-primary disabled:opacity-50"
+        >
+          {momentBusy ? (isZh ? "配图中…" : "Illustrating…") : (isZh ? "为这一刻配图" : "Illustrate this moment")}
+        </button>
+      ) : null}
+    </section>
   );
 }
 
@@ -292,7 +445,7 @@ function Zone(props: {
   );
 }
 
-function Row({ row, isZh }: { readonly row: HudRow; readonly isZh: boolean }) {
+function Row({ row, isZh, generating }: { readonly row: HudRow; readonly isZh: boolean; readonly generating?: boolean }) {
   const [open, setOpen] = useState(false);
   const expandable = row.details.length > 0;
   return (
@@ -304,7 +457,11 @@ function Row({ row, isZh }: { readonly row: HudRow; readonly isZh: boolean }) {
         className={`px-2.5 py-1.5 ${expandable ? "cursor-pointer" : ""}`}
       >
         <div className="flex items-baseline gap-1.5">
-          <span className="shrink-0 text-xs">{row.glyph}</span>
+          {row.imageUrl ? (
+            <img src={row.imageUrl} alt={row.label} className="h-7 w-7 shrink-0 self-center rounded object-cover" />
+          ) : (
+            <span className="shrink-0 text-xs">{generating ? "⏳" : row.glyph}</span>
+          )}
           <span className="text-[13px] font-medium text-foreground">{row.label}</span>
           {row.value ? <span className="ml-auto text-[13px] font-semibold text-primary">{row.value}</span> : null}
           {expandable ? (

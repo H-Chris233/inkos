@@ -2523,6 +2523,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         : entity;
     });
 
+    // Illustration of the current moment, if one was generated for this turn.
+    const sceneTurn = (currentState as { turn?: number } | null)?.turn ?? 0;
+    const sceneEntry = manifest[`scene-turn-${sceneTurn}`];
+    const sceneImageUrl = sceneEntry?.status === "ready" ? imageUrlFor(sceneEntry.file) : undefined;
+
     return c.json({
       worldId,
       runId,
@@ -2531,6 +2536,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       currentState,
       graph: { ...graph, entities: entitiesWithImages },
       imageSettings,
+      ...(sceneImageUrl ? { sceneImageUrl } : {}),
     });
   });
 
@@ -2563,15 +2569,23 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
 
     const store = new PlayStore(root);
     const runDir = store.runDir(worldId, runId);
-    const world = await store.loadWorld(worldId).catch(() => null);
+    const [world, currentState] = await Promise.all([
+      store.loadWorld(worldId).catch(() => null),
+      store.loadCurrentState(worldId, runId).catch(() => null),
+    ]);
     const premise = world?.premise;
 
     let key: string;
     let prompt: string;
     if (body.target === "scene") {
-      const sceneText = (body.sceneText ?? "").trim();
-      if (!sceneText) return c.json({ error: "sceneText is required for a scene image" }, 400);
-      key = body.sceneKey?.trim() || `scene-${sceneText.length}`;
+      // The current moment defaults to the rendered scene projection so the UI
+      // can offer a one-tap "illustrate this moment" without re-sending prose.
+      const sceneText = (
+        (body.sceneText ?? "").trim()
+        || (await store.readProjection(worldId, runId, "projections/scene.md").catch(() => "")).trim()
+      );
+      if (!sceneText) return c.json({ error: "no current scene to illustrate" }, 400);
+      key = body.sceneKey?.trim() || `scene-turn-${(currentState as { turn?: number } | null)?.turn ?? 0}`;
       prompt = buildPlaySceneImagePrompt(sceneText, premise);
     } else {
       const entityId = body.entityId?.trim();
