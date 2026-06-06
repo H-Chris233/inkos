@@ -500,7 +500,7 @@ function Row({ row, isZh, generating }: { readonly row: HudRow; readonly isZh: b
       >
         <div className="flex items-baseline gap-1.5">
           {row.imageUrl ? (
-            <img src={row.imageUrl} alt={row.label} className="h-7 w-7 shrink-0 self-center rounded object-cover" />
+            <img src={row.imageUrl} alt="" aria-hidden="true" className="h-7 w-7 shrink-0 self-center rounded object-cover" />
           ) : (
             <span className="shrink-0 text-xs">{generating ? "⏳" : row.glyph}</span>
           )}
