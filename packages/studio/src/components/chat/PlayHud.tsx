@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Gamepad2, X, ChevronDown } from "lucide-react";
 import { fetchJson } from "../../hooks/use-api";
+import {
+  HOLDING_TYPES, HOLDING_GLYPH, SLOT_GLYPH,
+  type HudDetail, type HudRow,
+} from "./play-hud/types";
 
 // The HUD is genre-neutral: it renders whatever the world graph contains,
 // grouped into "what I face" (world/here-now) and "what I hold" (backpack).
@@ -67,14 +71,6 @@ interface CoverConfigResponse {
   readonly providers?: ReadonlyArray<{ readonly service: string; readonly connected?: boolean }>;
 }
 
-const HOLDING_TYPES = new Set(["item", "evidence", "clue", "claim", "proof_chain"]);
-const HOLDING_GLYPH: Record<string, string> = {
-  item: "🎒", evidence: "📄", clue: "🔍", claim: "💡", proof_chain: "🔗",
-};
-const SLOT_GLYPH: Record<string, string> = {
-  timer: "⏳", pressure: "🔥", resource: "🪙", relation: "❤", clue: "🔍", evidence: "📄", flag: "🚩",
-};
-
 function formatValue(value: unknown): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
@@ -106,22 +102,6 @@ function isHeldEntity(entity: PlayEntity, currentEdges: ReadonlyArray<PlayEdge>)
   );
 }
 
-interface HudDetail {
-  readonly label?: string;
-  readonly text: string;
-}
-interface HudRow {
-  readonly id: string;
-  readonly glyph: string;
-  readonly label: string;
-  readonly value?: string;
-  readonly note?: string | null;
-  // Extra info shown when the row is expanded (summary, relationships, why a
-  // meter changed). A row is expandable only when this is non-empty.
-  readonly details: ReadonlyArray<HudDetail>;
-  // Generated illustration for this entity (actor portrait / item still), if any.
-  readonly imageUrl?: string;
-}
 interface HudView {
   readonly turn: number | null;
   readonly mode: string | null;
