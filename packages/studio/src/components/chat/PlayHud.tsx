@@ -278,9 +278,10 @@ export function buildView(run: PlayRunResponse | null): HudView | null {
     .filter((slot) => !slot.ownerEntityId)
     .map((slot) => {
       const cause = slot.updatedEventId ? outcomeOf.get(slot.updatedEventId) || "" : "";
+      const { text, ratio } = meterDisplay(slot.value);
       return {
-        id: slot.id, glyph: SLOT_GLYPH[slot.kind] ?? "•", label: slot.label,
-        value: meterDisplay(slot.value).text, note: null,
+        id: slot.id, glyph: SLOT_GLYPH[slot.kind] ?? "•", label: slot.label, kind: slot.kind,
+        value: text, ratio, note: null,
         details: cause ? [{ label: "因为", text: cause }] : [],
       };
     });

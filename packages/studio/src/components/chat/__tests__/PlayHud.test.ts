@@ -237,6 +237,25 @@ describe("PlayHud buildView", () => {
     expect(view?.meters.map((m) => m.label)).toEqual(["追兵"]);
   });
 
+  it("carries kind and a progress ratio on world-level meters for gauge rendering", () => {
+    const view = buildView({
+      currentState: { turn: 1, mode: "open", premise: "x。" },
+      graph: {
+        entities: [],
+        edges: [],
+        stateSlots: [
+          { id: "s-hp", kind: "resource", label: "体力", value: { current: 62, max: 80 } },
+          { id: "s-chase", kind: "pressure", label: "追兵", value: "逼近" },
+        ],
+        events: [],
+      },
+    });
+    expect(view?.meters.map((m) => [m.label, m.kind, m.value, m.ratio])).toEqual([
+      ["体力", "resource", "62/80", 0.775],
+      ["追兵", "pressure", "逼近", undefined],
+    ]);
+  });
+
   it("reads the evidence lifecycle ladder and reason from the owner-scoped evidence slot", () => {
     const view = buildView({
       currentState: { turn: 3, mode: "guided", premise: "推理。" },

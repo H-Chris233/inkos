@@ -18,6 +18,8 @@ export interface HudRow {
   readonly imageUrl?: string;
   // 0..1 fill for a meter bar when the slot value is numeric {current,min,max}.
   readonly ratio?: number;
+  // state-slot kind (resource/pressure/timer/…), used to pick a gauge style.
+  readonly kind?: string;
 }
 
 export interface HoldingRelation {
